@@ -29,7 +29,7 @@ import org.springframework.stereotype.Component;
 /**
  * Bridges CRD coverage evaluation (PlanDefinition/CQL) into PAS review action decisions.
  * Reuses the same PlanDefinitions that drive CDS Hook cards, translating CRD outcomes
- * (pa-needed, covered, doc-needed) into X12 306 review action codes (A1-A4).
+ * (pa-needed, covered, doc-needed) into X12 306 review action codes (A1, A3, A4, NA).
  */
 @Component
 public class PasCoverageEvaluator {
@@ -89,7 +89,7 @@ public class PasCoverageEvaluator {
    * Returns the PAS review action decision based on CRD coverage-information output.
    *
    * When multiple PlanDefinitions match, the most restrictive decision wins:
-   * A2 (Not Certified) > A4 (Pended) > A1 (Certified) > A3 (Not Required).
+   * A3 (Not Certified) > A4 (Pended) > A1 (Certified) > NA (Not Required).
    * Plans triggered exclusively by order-dispatch are excluded unless the
    * order in the request bundle shows dispatch-stage evidence.
    *
@@ -99,7 +99,7 @@ public class PasCoverageEvaluator {
    * @param patientId the Patient ID for PlanDefinition $apply
    * @param dataBundle the full request bundle as additional data context
    * @return the most restrictive CoverageDecision across all matching PlanDefinitions,
-   *         or A3 (Not Required) if no PlanDefinitions match
+   *         or NA (Not Required) if no PlanDefinitions match
    */
   public CoverageDecision evaluate(Coding orderCode, List<Identifier> payorIdentifiers,
       Coverage coverage, String patientId, Bundle dataBundle) {
@@ -116,7 +116,7 @@ public class PasCoverageEvaluator {
         : null;
 
     if (plans.isEmpty()) {
-      return new CoverageDecision(REVIEW_CODE_A3, "Not Required", false);
+      return new CoverageDecision(REVIEW_CODE_NA, "Not Required", false);
     }
 
     CoverageDecision best = null;
@@ -137,9 +137,9 @@ public class PasCoverageEvaluator {
       }
     }
 
-    // If all plans returned null coverage extensions, default to A3
+    // If all plans returned null coverage extensions, default to NA
     if (best == null) {
-      return new CoverageDecision(REVIEW_CODE_A3, "Not Required", false);
+      return new CoverageDecision(REVIEW_CODE_NA, "Not Required", false);
     }
 
     return best;
@@ -164,14 +164,14 @@ public class PasCoverageEvaluator {
 
   /**
    * Assigns a numeric rank to a review action code for selecting the most restrictive decision.
-   * Higher rank = more restrictive: A2=4, A4=3, A1=2, A3=1.
+   * Higher rank = more restrictive: A3=4, A4=3, A1=2, NA=1.
    */
   private int rankDecision(String reviewActionCode) {
     return switch (reviewActionCode) {
-      case REVIEW_CODE_A2 -> 4;
+      case REVIEW_CODE_A3 -> 4;
       case REVIEW_CODE_A4 -> 3;
       case REVIEW_CODE_A1 -> 2;
-      default -> 1; // A3
+      default -> 1; // NA
     };
   }
 
@@ -184,7 +184,7 @@ public class PasCoverageEvaluator {
     String paNeeded = CoverageInfoUtil.subExtensionCode(coverageInfoExt, "pa-needed");
 
     if ("not-covered".equals(covered)) {
-      return new CoverageDecision(REVIEW_CODE_A2, "Not Certified", false);
+      return new CoverageDecision(REVIEW_CODE_A3, "Not Certified", false);
     }
     if ("conditional".equals(covered)) {
       return buildPendedDecision(coverageInfoExt);
@@ -197,7 +197,7 @@ public class PasCoverageEvaluator {
       return buildPendedDecision(coverageInfoExt);
     }
     // no-auth or no pa-needed value
-    return new CoverageDecision(REVIEW_CODE_A3, "Not Required", false);
+    return new CoverageDecision(REVIEW_CODE_NA, "Not Required", false);
   }
 
   /**

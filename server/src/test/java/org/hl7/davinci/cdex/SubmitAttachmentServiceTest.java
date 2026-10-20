@@ -43,6 +43,8 @@ import ca.uhn.fhir.rest.param.UriParam;
 
 class SubmitAttachmentServiceTest {
 
+  private static final String PAYER_BASE = "http://payer.test/fhir";
+
   private DaoRegistry daoRegistry;
   private PasPendedResolutionService resolutionService;
   private IFhirResourceDao<ClaimResponse> crDao;
@@ -85,13 +87,21 @@ class SubmitAttachmentServiceTest {
           Questionnaire q = questionnaireByUrl.get(url);
           return q == null ? List.of() : List.of(q);
         });
+    when(questionnaireDao.read(any(IdType.class), any(RequestDetails.class)))
+        .thenAnswer(inv -> questionnaireByUrl.values().stream()
+            .filter(q -> q.getIdElement().getIdPart().equals(((IdType) inv.getArgument(0)).getIdPart()))
+            .findFirst()
+            .orElseThrow(() -> new ca.uhn.fhir.rest.server.exceptions.ResourceNotFoundException("gone")));
     when(daoRegistry.getResourceDao(Questionnaire.class)).thenReturn(questionnaireDao);
 
     qrDao = mock(IFhirResourceDao.class);
     when(qrDao.create(any(), any(RequestDetails.class))).thenReturn(new DaoMethodOutcome());
     when(daoRegistry.getResourceDao("QuestionnaireResponse")).thenReturn((IFhirResourceDao) qrDao);
 
-    service = new SubmitAttachmentService(daoRegistry, resolutionService, FhirContext.forR4());
+    ca.uhn.fhir.jpa.starter.AppProperties appProperties = new ca.uhn.fhir.jpa.starter.AppProperties();
+    appProperties.setServer_address(PAYER_BASE);
+    service = new SubmitAttachmentService(daoRegistry, resolutionService, FhirContext.forR4(),
+        new org.hl7.davinci.pas.PasQuestionnaireAddresses(appProperties, daoRegistry));
   }
 
   private static String urlOf(SearchParameterMap map) {
@@ -178,6 +188,20 @@ class SubmitAttachmentServiceTest {
 
     verify(resolutionService, never()).resolveNow(anyString());
     assertEquals(CommunicationRequestStatus.COMPLETED, crA.getStatus());
+    assertEquals(CommunicationRequestStatus.ACTIVE, crB.getStatus());
+  }
+
+  @Test
+  void questionnaireNamedByItsPayerAddressCompletesTheRequest() {
+    CommunicationRequest crA = documentationRequest("cr-a", 1, "http://example.org/Questionnaire/A");
+    CommunicationRequest crB = documentationRequest("cr-b", 2, "http://example.org/Questionnaire/B");
+    pendedClaimResponse(crA, crB);
+    questionnaire("qA", "http://example.org/Questionnaire/A");
+
+    submit(questionnaireResponse(PAYER_BASE + "/Questionnaire/qA"), null, false);
+
+    assertEquals(CommunicationRequestStatus.COMPLETED, crA.getStatus(),
+        "the payer address of a questionnaire stands for its canonical");
     assertEquals(CommunicationRequestStatus.ACTIVE, crB.getStatus());
   }
 

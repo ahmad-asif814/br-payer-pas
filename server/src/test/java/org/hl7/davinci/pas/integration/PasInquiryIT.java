@@ -122,7 +122,7 @@ class PasInquiryIT {
     assertTrue(result.hasParameter(), "Parameters should contain at least one responseBundle");
 
     Parameters.ParametersParameterComponent param = result.getParameter().stream()
-        .filter(p -> "responseBundle".equals(p.getName()))
+        .filter(p -> "return".equals(p.getName()))
         .findFirst()
         .orElseThrow(() -> new AssertionError("No responseBundle parameter found"));
 
@@ -150,7 +150,7 @@ class PasInquiryIT {
 
     // Find the specific ClaimResponse we submitted (pre-loaded examples may also match)
     ClaimResponse matchedCr = result.getParameter().stream()
-        .filter(p -> "responseBundle".equals(p.getName()))
+        .filter(p -> "return".equals(p.getName()))
         .map(p -> (Bundle) p.getResource())
         .map(b -> (ClaimResponse) b.getEntryFirstRep().getResource())
         .filter(cr -> submittedId.equals(cr.getIdElement().getIdPart()))
@@ -185,7 +185,7 @@ class PasInquiryIT {
 
     assertNotNull(result);
     assertTrue(result.getParameter().stream()
-        .noneMatch(p -> "responseBundle".equals(p.getName())),
+        .noneMatch(p -> "return".equals(p.getName())),
         "Should return no responseBundle for non-matching inquiry");
   }
 

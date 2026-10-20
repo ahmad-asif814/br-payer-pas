@@ -14,6 +14,7 @@ import ca.uhn.fhir.jpa.api.model.DaoMethodOutcome;
 import ca.uhn.fhir.jpa.searchparam.SearchParameterMap;
 import ca.uhn.fhir.jpa.starter.AppProperties;
 import ca.uhn.fhir.rest.api.server.RequestDetails;
+import ca.uhn.fhir.rest.param.ReferenceParam;
 import org.hl7.davinci.pas.PasCoverageEvaluator.CoverageDecision;
 import org.hl7.davinci.pas.PasSubmitService.SubmissionType;
 import org.hl7.fhir.r4.model.*;
@@ -40,6 +41,9 @@ class PasSubmitServiceTest {
     validator = mock(PasBundleValidator.class);
     evaluator = mock(PasCoverageEvaluator.class);
     responseBuilder = mock(PasResponseBuilder.class);
+    // Presenting a response to the provider and naming a questionnaire are pass-throughs here
+    when(responseBuilder.presentToProvider(any())).thenAnswer(inv -> inv.getArgument(0));
+    when(responseBuilder.questionnaireCanonical(any())).thenAnswer(inv -> inv.getArgument(0));
     bundleReferenceResolver = mock(PasBundleReferenceResolver.class);
     resolutionService = mock(PasPendedResolutionService.class);
     notificationService = mock(PasSubscriptionNotificationService.class);
@@ -87,7 +91,8 @@ class PasSubmitServiceTest {
 
     PasProperties pasProperties = new PasProperties(30, "AUTH-", 100);
     service = new PasSubmitService(validator, evaluator, responseBuilder, daoRegistry,
-        bundleReferenceResolver, resolutionService, notificationService, appProperties, pasProperties);
+        bundleReferenceResolver, resolutionService, notificationService, appProperties, pasProperties,
+        new PasDemoOutcomes(new PasDemoOutcomes.Properties(Map.of())));
   }
 
   @Test
@@ -404,7 +409,7 @@ class PasSubmitServiceTest {
     service.submit(requestBundle);
 
     Map<Integer, CoverageDecision> decisions = captureAppliedDecisions();
-    assertEquals(REVIEW_CODE_A2, decisions.get(1).reviewActionCode());
+    assertEquals(REVIEW_CODE_A3, decisions.get(1).reviewActionCode());
     verifyCrUpdatedNotCreated();
   }
 
@@ -414,7 +419,7 @@ class PasSubmitServiceTest {
     Claim claim = (Claim) requestBundle.getEntryFirstRep().getResource();
     when(validator.validateSubmitBundle(requestBundle)).thenReturn(claim);
     mockStoredClaimSearch(buildStoredPriorClaim());
-    mockClaimResponseSearch(buildPriorClaimResponse(REVIEW_CODE_A2, "Not Certified"));
+    mockClaimResponseSearch(buildPriorClaimResponse(REVIEW_CODE_A3, "Not Certified"));
 
     assertThrows(IllegalArgumentException.class, () -> service.submit(requestBundle));
   }
@@ -446,7 +451,7 @@ class PasSubmitServiceTest {
 
     Map<Integer, CoverageDecision> decisions = captureAppliedDecisions();
     assertEquals(REVIEW_CODE_A1, decisions.get(1).reviewActionCode());
-    assertEquals(REVIEW_CODE_A3, decisions.get(2).reviewActionCode());
+    assertEquals(REVIEW_CODE_NA, decisions.get(2).reviewActionCode());
     verifyCrUpdatedNotCreated();
   }
 
@@ -467,7 +472,70 @@ class PasSubmitServiceTest {
     assertTrue(ex.getMessage().contains("prior Claim"));
   }
 
+  @Test
+  void submit_updateOfAnEarlierUpdate_findsTheAuthorizationThroughItsOpeningClaim() {
+    // The newest stored Claim with the identifier is the previous update's Claim, which has no
+    // ClaimResponse of its own: the authorization is the one the opening Claim created.
+    Bundle requestBundle = buildUpdateBundle("prior-claim-id");
+    Claim claim = (Claim) requestBundle.getEntryFirstRep().getResource();
+    when(validator.validateSubmitBundle(requestBundle)).thenReturn(claim);
+    mockUpdatePathResponse();
+    Claim previousUpdate = new Claim();
+    previousUpdate.setId("server-previous-update-claim-id");
+    mockStoredClaimSearch(previousUpdate, buildStoredPriorClaim());
+    ClaimResponse authorization = buildPriorClaimResponse(REVIEW_CODE_A1, "Certified in total");
+    IFhirResourceDao<ClaimResponse> crDao =
+        (IFhirResourceDao<ClaimResponse>) daoRegistry.getResourceDao(ClaimResponse.class);
+    when(crDao.searchForResources(any(SearchParameterMap.class), any(RequestDetails.class)))
+        .thenAnswer(call -> {
+          SearchParameterMap params = call.getArgument(0);
+          String request = ((ReferenceParam) params.get("request").get(0).get(0)).getValue();
+          return "Claim/server-stored-prior-claim-id".equals(request) ? List.of(authorization) : List.of();
+        });
+    when(evaluator.evaluate(any(), any(), any(), any(), any()))
+        .thenReturn(new CoverageDecision(REVIEW_CODE_A1, "Certified", false));
+
+    service.submit(requestBundle);
+
+    verifyCrUpdatedNotCreated();
+  }
+
+  @Test
+  void submit_updateWhenNoStoredClaimHasAnAuthorization_throws() {
+    Bundle requestBundle = buildUpdateBundle("prior-claim-id");
+    Claim claim = (Claim) requestBundle.getEntryFirstRep().getResource();
+    when(validator.validateSubmitBundle(requestBundle)).thenReturn(claim);
+    mockStoredClaimSearch(buildStoredPriorClaim());
+    mockClaimResponseSearch();
+
+    IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+        () -> service.submit(requestBundle));
+    assertTrue(ex.getMessage().contains("ClaimResponse not found"));
+  }
+
   // ===== Cancel Tests =====
+
+  @Test
+  void submit_cancelAfterOneLineWasCancelled_isAllowed() {
+    // An earlier update cancelled line 2 (A3); the authorization as a whole is not denied
+    Bundle requestBundle = buildCancelBundle("prior-claim-id");
+    Claim claim = (Claim) requestBundle.getEntryFirstRep().getResource();
+    when(validator.validateSubmitBundle(requestBundle)).thenReturn(claim);
+    mockUpdatePathResponse();
+    mockStoredClaimSearch(buildStoredPriorClaim());
+    ClaimResponse prior = buildPriorClaimResponse(REVIEW_CODE_A1, "Certified");
+    ClaimResponse.ItemComponent cancelled = prior.addItem().setItemSequence(2);
+    cancelled.addAdjudication().addExtension(
+        PasExtensions.buildReviewActionExtension(REVIEW_CODE_A3, "Not Certified", null));
+    mockClaimResponseSearch(prior);
+
+    service.submit(requestBundle);
+
+    Map<Integer, CoverageDecision> decisions = captureAppliedDecisions();
+    assertEquals(REVIEW_CODE_A3, decisions.get(1).reviewActionCode());
+    assertEquals(REVIEW_CODE_A3, decisions.get(2).reviewActionCode());
+    verifyCrUpdatedNotCreated();
+  }
 
   @Test
   void submit_cancelAllItemsGetA2() {
@@ -482,7 +550,7 @@ class PasSubmitServiceTest {
 
     verifyNoInteractions(evaluator);
     Map<Integer, CoverageDecision> decisions = captureAppliedDecisions();
-    assertEquals(REVIEW_CODE_A2, decisions.get(1).reviewActionCode());
+    assertEquals(REVIEW_CODE_A3, decisions.get(1).reviewActionCode());
     verifyCrUpdatedNotCreated();
   }
 
@@ -556,7 +624,7 @@ class PasSubmitServiceTest {
     // Decisions are derived from prior CR items, not the cancel Claim's (empty) items
     Map<Integer, CoverageDecision> decisions = captureAppliedDecisions();
     assertFalse(decisions.isEmpty());
-    assertEquals(REVIEW_CODE_A2, decisions.get(1).reviewActionCode());
+    assertEquals(REVIEW_CODE_A3, decisions.get(1).reviewActionCode());
   }
 
   @Test
@@ -602,7 +670,7 @@ class PasSubmitServiceTest {
     Claim claim = (Claim) requestBundle.getEntryFirstRep().getResource();
     when(validator.validateSubmitBundle(requestBundle)).thenReturn(claim);
     mockStoredClaimSearch(buildStoredPriorClaim());
-    mockClaimResponseSearch(buildPriorClaimResponse(REVIEW_CODE_A2, "Not Certified"));
+    mockClaimResponseSearch(buildPriorClaimResponse(REVIEW_CODE_A3, "Not Certified"));
 
     IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
         () -> service.submit(requestBundle));

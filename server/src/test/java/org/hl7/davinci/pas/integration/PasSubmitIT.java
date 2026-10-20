@@ -11,9 +11,11 @@ import org.hl7.davinci.pas.PasSubmitService;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Claim;
 import org.hl7.fhir.r4.model.ClaimResponse;
+import org.hl7.fhir.r4.model.CommunicationRequest;
 import org.hl7.fhir.r4.model.Extension;
 import org.hl7.fhir.r4.model.IdType;
 import org.hl7.fhir.r4.model.Patient;
+import org.hl7.fhir.r4.model.Task;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -229,9 +231,21 @@ class PasSubmitIT {
     assertNotNull(stored, "Patient should be stored and findable by identifier");
     assertNotEquals("1716", stored.getIdElement().getIdPart(),
         "Stored Patient must carry a payer-assigned id, not the provider's");
+    ClaimResponse storedCr = daoRegistry.getResourceDao(ClaimResponse.class)
+        .read(new org.hl7.fhir.r4.model.IdType("ClaimResponse", cr.getIdElement().getIdPart()),
+            new SystemRequestDetails());
     assertEquals("Patient/" + stored.getIdElement().getIdPart(),
-        cr.getPatient().getReference(),
-        "ClaimResponse.patient must reference the payer-side Patient");
+        storedCr.getPatient().getReference(),
+        "The stored ClaimResponse.patient must reference the payer-side Patient");
+
+    // The response echoes the provider's own Patient, unchanged, and points at it
+    Bundle.BundleEntryComponent echoed = response.getEntry().stream()
+        .filter(e -> e.getResource() instanceof Patient)
+        .findFirst()
+        .orElseThrow(() -> new AssertionError("Response must echo the provider's Patient"));
+    assertEquals("1716", echoed.getResource().getIdElement().getIdPart());
+    assertEquals(echoed.getFullUrl(), cr.getPatient().getReference(),
+        "The returned ClaimResponse.patient must resolve to the echoed Patient");
   }
 
   @Test
@@ -268,6 +282,72 @@ class PasSubmitIT {
         "the documentation-required demo rule must always pend");
     assertTrue(cr.hasCommunicationRequest(),
         "pended response must reference the questionnaire CommunicationRequest");
+  }
+
+  @Test
+  @Timeout(value = 60, unit = TimeUnit.SECONDS)
+  @DisplayName("demo 'modified' code certifies with changes and returns the line as an addItem")
+  void demoModifiedCodeReturnsAddItem() {
+    Bundle response = submitService.submit(referralBundleWithCode("42"));
+    ClaimResponse cr = (ClaimResponse) response.getEntryFirstRep().getResource();
+
+    assertEquals(org.hl7.davinci.common.FhirConstants.REVIEW_CODE_A6,
+        org.hl7.davinci.pas.PasExtensions.extractReviewActionCode(cr.getItemFirstRep()));
+    assertTrue(cr.hasAddItem(), "a modified decision returns the line as authorized");
+    assertTrue(cr.hasProcessNote() && cr.hasPreAuthPeriod() && cr.hasAdjudication());
+  }
+
+  @Test
+  @Timeout(value = 60, unit = TimeUnit.SECONDS)
+  @DisplayName("demo 'document' code pends for a document and stores a Task for the stored Claim")
+  void demoDocumentCodeStoresTaskForTheClaim() {
+    Bundle response = submitService.submit(referralBundleWithCode("PT"));
+    ClaimResponse cr = (ClaimResponse) response.getEntryFirstRep().getResource();
+
+    Bundle.BundleEntryComponent taskEntry = response.getEntry().stream()
+        .filter(e -> e.getResource() instanceof Task)
+        .findFirst()
+        .orElseThrow(() -> new AssertionError("Response must carry the attachment-request Task"));
+    assertTrue(taskEntry.getFullUrl().contains("/Task/"), "the Task is stored on the payer");
+    Task stored = daoRegistry.getResourceDao(Task.class)
+        .read(new IdType("Task", taskEntry.getResource().getIdElement().getIdPart()), new SystemRequestDetails());
+    ClaimResponse storedCr = daoRegistry.getResourceDao(ClaimResponse.class)
+        .read(new IdType("ClaimResponse", cr.getIdElement().getIdPart()), new SystemRequestDetails());
+    assertEquals(storedCr.getRequest().getReference(), stored.getReasonReference().getReference());
+    assertTrue(stored.getFor().getReference().startsWith("Patient/"));
+    assertTrue(response.getEntry().stream().anyMatch(e -> e.getResource() instanceof CommunicationRequest cr2
+        && cr2.getPayloadFirstRep().hasExtension(PasConstants.EXT_CONTENT_MODIFIER)));
+  }
+
+  @Test
+  @Timeout(value = 60, unit = TimeUnit.SECONDS)
+  @DisplayName("demo 'error' code is rejected with ClaimResponse.error and nothing is stored")
+  void demoErrorCodeIsRejectedInBand() {
+    int storedBefore = daoRegistry.getResourceDao(ClaimResponse.class)
+        .searchForResources(new ca.uhn.fhir.jpa.searchparam.SearchParameterMap().setLoadSynchronous(true),
+            new SystemRequestDetails()).size();
+
+    Bundle response = submitService.submit(referralBundleWithCode("6"));
+    ClaimResponse cr = (ClaimResponse) response.getEntryFirstRep().getResource();
+
+    assertEquals(ClaimResponse.RemittanceOutcome.ERROR, cr.getOutcome());
+    assertTrue(cr.hasError());
+    assertTrue(response.getEntryFirstRep().getFullUrl().startsWith("urn:uuid:"));
+    assertTrue(response.getEntry().stream().anyMatch(e -> e.getResource() instanceof Patient),
+        "the provider's Patient is still echoed");
+    assertEquals(storedBefore, daoRegistry.getResourceDao(ClaimResponse.class)
+        .searchForResources(new ca.uhn.fhir.jpa.searchparam.SearchParameterMap().setLoadSynchronous(true),
+            new SystemRequestDetails()).size(), "a rejected request stores no ClaimResponse");
+  }
+
+  private Bundle referralBundleWithCode(String code) {
+    Bundle request = loadBundle(REFERRAL_BUNDLE);
+    Claim claim = (Claim) request.getEntryFirstRep().getResource();
+    for (Claim.ItemComponent item : claim.getItem()) {
+      item.setProductOrService(new org.hl7.fhir.r4.model.CodeableConcept().addCoding(
+          new org.hl7.fhir.r4.model.Coding("https://codesystem.x12.org/005010/1365", code, null)));
+    }
+    return request;
   }
 
   private Bundle loadBundle(String classpathPath) {

@@ -55,8 +55,12 @@ public class PasBundleReferenceResolver {
    * resources, including Claim.careTeam providers. When storeMissing is true (submit path),
    * unresolved bundle resources are stored under payer-assigned ids and cross-references are
    * rewritten. When false (inquiry path), references are resolved without storing.
+   *
+   * @return on the submit path, the provider's original reference -> payer-side reference for
+   *     every rewrite made, so a response can be expressed back in the provider's terms;
+   *     null on the inquiry path
    */
-  public void resolveReferences(Bundle requestBundle, Claim claim, boolean storeMissing) {
+  public Map<String, String> resolveReferences(Bundle requestBundle, Claim claim, boolean storeMissing) {
     Map<String, String> refMap = storeMissing ? new LinkedHashMap<>() : null;
     resolvePatient(requestBundle, claim, refMap);
     resolveOrganization(requestBundle, claim.getInsurer(), refMap);
@@ -65,6 +69,7 @@ public class PasBundleReferenceResolver {
     resolveCoverage(requestBundle, claim, refMap);
     resolveRequestedServiceOrders(requestBundle, claim, refMap);
     resolveSupportingInfoQuestionnaireResponses(requestBundle, claim, refMap);
+    return refMap;
   }
 
   /**

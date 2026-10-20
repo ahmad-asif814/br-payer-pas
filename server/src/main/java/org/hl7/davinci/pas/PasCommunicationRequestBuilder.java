@@ -3,9 +3,11 @@ package org.hl7.davinci.pas;
 import java.util.UUID;
 
 import org.hl7.fhir.r4.model.CanonicalType;
+import org.hl7.fhir.r4.model.Claim;
 import org.hl7.fhir.r4.model.CodeableConcept;
 import org.hl7.fhir.r4.model.Coding;
 import org.hl7.fhir.r4.model.CommunicationRequest;
+import org.hl7.fhir.r4.model.Extension;
 import org.hl7.fhir.r4.model.Identifier;
 import org.hl7.fhir.r4.model.Meta;
 import org.hl7.fhir.r4.model.PositiveIntType;
@@ -33,11 +35,43 @@ public final class PasCommunicationRequestBuilder {
     return request;
   }
 
-  /** Builds an attachment-code additional-information request (one LOINC/PWK code per request). */
+  /**
+   * Builds an attachment-code additional-information request (one LOINC/PWK code per request),
+   * qualified by the payer's attachment modifier.
+   */
   public static CommunicationRequest buildAttachmentCodeRequest(int lineNumber, String code,
       String patientRef) {
     CommunicationRequest request = base(lineNumber, patientRef, UUID.randomUUID().toString());
-    request.addPayload().setContent(new StringType(code));
+    request.addPayload().setContent(new StringType(code)).addExtension(contentModifierExtension());
+    return request;
+  }
+
+  /** The contentModifier qualifying a requested document. */
+  public static Extension contentModifierExtension() {
+    return new Extension(PasConstants.EXT_CONTENT_MODIFIER, new CodeableConcept().addCoding(
+        new Coding(PasConstants.LOINC_SYSTEM, PasConstants.LOINC_ATTACHMENT_MODIFIER, null)));
+  }
+
+  /**
+   * Fills in who the request is between and how to answer it, from the Claim it is about: the
+   * insurer asks, the requesting provider is to send the information back through CDex. The
+   * Claim's principal diagnosis, when it has one, is carried as the diagnosis the request
+   * relates to.
+   */
+  public static CommunicationRequest addressFromClaim(CommunicationRequest request, Claim claim) {
+    request.addMedium(new CodeableConcept().addCoding(new Coding(
+        PasConstants.PAS_TEMP_CODES_SYSTEM, PasConstants.MEDIUM_CDEX, null)));
+    if (claim.getInsurer().hasReference()) {
+      request.setRequester(claim.getInsurer().copy());
+    }
+    if (claim.getProvider().hasReference()) {
+      request.addRecipient(claim.getProvider().copy());
+      request.setSender(claim.getProvider().copy());
+    }
+    if (request.hasPayload() && claim.getDiagnosisFirstRep().hasDiagnosisCodeableConcept()) {
+      request.getPayloadFirstRep().addExtension(PasConstants.EXT_COMMUNICATED_DIAGNOSIS,
+          claim.getDiagnosisFirstRep().getDiagnosisCodeableConcept().copy());
+    }
     return request;
   }
 

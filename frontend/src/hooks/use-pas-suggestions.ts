@@ -54,7 +54,7 @@ export function usePasSuggestions(
             reason: "Cancel authorization",
           },
         ];
-      case "A2":
+      case "A3":
         return [
           {
             operation: "$submit",
@@ -75,7 +75,7 @@ export function usePasSuggestions(
             reason: "Cancel authorization",
           },
         ];
-      case "A3":
+      case "NA":
         return [];
       default:
         return [];

@@ -12,17 +12,21 @@ public class PasSubscriptionCriteriaInterceptorRegistrar {
 
   private final IInterceptorService myInterceptorService;
   private final PasSubscriptionCriteriaInterceptor myInterceptor;
+  private final PasNotificationInterceptor myNotificationInterceptor;
 
   public PasSubscriptionCriteriaInterceptorRegistrar(
       IInterceptorService theInterceptorService,
-      PasSubscriptionCriteriaInterceptor theInterceptor) {
+      PasSubscriptionCriteriaInterceptor theInterceptor,
+      PasNotificationInterceptor theNotificationInterceptor) {
     myInterceptorService = theInterceptorService;
     myInterceptor = theInterceptor;
+    myNotificationInterceptor = theNotificationInterceptor;
   }
 
   @EventListener(classes = {ContextRefreshedEvent.class})
   @Order(IHapiBootOrder.REGISTER_INTERCEPTORS)
   public void register() {
     myInterceptorService.registerInterceptor(myInterceptor);
+    myInterceptorService.registerInterceptor(myNotificationInterceptor);
   }
 }

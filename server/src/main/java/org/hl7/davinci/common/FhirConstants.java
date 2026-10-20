@@ -72,10 +72,11 @@ public final class FhirConstants {
   // X12 306 Review Action Codes (https://codesystem.x12.org/005010/306)
   public static final String X12_REVIEW_CODE_SYSTEM = "https://codesystem.x12.org/005010/306";
   public static final String REVIEW_CODE_A1 = "A1"; // Certified in Total
-  public static final String REVIEW_CODE_A2 = "A2"; // Not Certified
-  public static final String REVIEW_CODE_A3 = "A3"; // Not Required
+  public static final String REVIEW_CODE_A2 = "A2"; // Certified - Partial
+  public static final String REVIEW_CODE_A3 = "A3"; // Not Certified
   public static final String REVIEW_CODE_A4 = "A4"; // Pended
   public static final String REVIEW_CODE_A6 = "A6"; // Modified
+  public static final String REVIEW_CODE_NA = "NA"; // No Action Required (prior authorization not required)
 
   // X12 1322 Certification Type codes (https://codesystem.x12.org/005010/1322)
   public static final String X12_CERT_TYPE_SYSTEM = "https://codesystem.x12.org/005010/1322";

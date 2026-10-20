@@ -28,6 +28,7 @@ import org.hl7.fhir.r4.model.Questionnaire;
 import org.hl7.fhir.r4.model.QuestionnaireResponse;
 import org.hl7.fhir.r4.model.Reference;
 import org.hl7.fhir.r4.model.StringType;
+import org.hl7.fhir.r4.model.Task;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.stereotype.Service;
 
@@ -52,6 +53,9 @@ public class PasSubmitService {
 
   enum SubmissionType { INITIAL, RENEWAL, UPDATE, CANCEL }
 
+  /** How many stored Claims sharing a prior Claim's identifier are considered, newest first. */
+  private static final int PRIOR_CLAIM_SEARCH_LIMIT = 50;
+
   /**
    * Holds item decisions plus the prior ClaimResponse (non-null for update/cancel paths).
    * When priorClaimResponse is present, the existing CR is modified in-place rather than
@@ -70,6 +74,7 @@ public class PasSubmitService {
   private final PasPendedResolutionService resolutionService;
   private final PasSubscriptionNotificationService notificationService;
   private final PasProperties pasProperties;
+  private final PasDemoOutcomes demoOutcomes;
   private final String serverBase;
 
   public PasSubmitService(PasBundleValidator validator, PasCoverageEvaluator evaluator,
@@ -77,7 +82,7 @@ public class PasSubmitService {
       PasBundleReferenceResolver bundleReferenceResolver,
       PasPendedResolutionService resolutionService,
       PasSubscriptionNotificationService notificationService, AppProperties appProperties,
-      PasProperties pasProperties) {
+      PasProperties pasProperties, PasDemoOutcomes demoOutcomes) {
     this.validator = validator;
     this.evaluator = evaluator;
     this.responseBuilder = responseBuilder;
@@ -86,6 +91,7 @@ public class PasSubmitService {
     this.resolutionService = resolutionService;
     this.notificationService = notificationService;
     this.pasProperties = pasProperties;
+    this.demoOutcomes = demoOutcomes;
     this.serverBase = FhirUtil.normalizeServerBase(appProperties.getServer_address());
   }
 
@@ -99,7 +105,21 @@ public class PasSubmitService {
    */
   public Bundle submit(Bundle requestBundle) {
     Claim claim = validator.validateSubmitBundle(requestBundle);
+    // Reference resolution below rewrites the request in place; the response has to echo the
+    // provider's resources exactly as they were sent.
+    Bundle originalRequest = requestBundle.copy();
     SubmissionType type = detectSubmissionType(claim);
+
+    // A rejected request is answered with ClaimResponse.error. Nothing is stored for it, so its
+    // references stay the provider's own.
+    List<Claim.ItemComponent> rejectedItems = claim.getItem().stream()
+        .filter(demoOutcomes::isRejected)
+        .toList();
+    if (!rejectedItems.isEmpty()) {
+      return responseBuilder.presentToProvider(PasProviderResponseView.forSubmit(
+          responseBuilder.buildErrorResponse(claim, requestBundle, rejectedItems),
+          originalRequest, Map.of()));
+    }
 
     Coverage coverage = findCoverage(requestBundle, claim);
     List<Identifier> payorIdentifiers = extractPayorIdentifiers(requestBundle, coverage);
@@ -118,7 +138,8 @@ public class PasSubmitService {
     String authPrefix = pasProperties.authorizationNumberPrefix();
 
     // Resolve bundle resources to server-side resources before storing the Claim
-    bundleReferenceResolver.resolveReferences(requestBundle, claim, true);
+    Map<String, String> providerToPayerRefs =
+        bundleReferenceResolver.resolveReferences(requestBundle, claim, true);
 
     // Store the incoming Claim for audit trail (all paths)
     claim.setId((String) null);
@@ -126,10 +147,11 @@ public class PasSubmitService {
         .create(claim, new SystemRequestDetails());
     String serverClaimId = claimOutcome.getId().getIdPart();
 
-    if (result.priorClaimResponse() != null) {
-      return persistUpdatePath(claim, result, authPrefix, requestBundle);
-    }
-    return persistCreatePath(claim, requestBundle, result, serverClaimId, authPrefix);
+    Bundle responseBundle = result.priorClaimResponse() != null
+        ? persistUpdatePath(claim, result, authPrefix, requestBundle)
+        : persistCreatePath(claim, requestBundle, result, serverClaimId, authPrefix);
+    return responseBuilder.presentToProvider(
+        PasProviderResponseView.forSubmit(responseBundle, originalRequest, providerToPayerRefs));
   }
 
   /**
@@ -152,6 +174,7 @@ public class PasSubmitService {
     }
 
     claimResponse.setRequest(new Reference("Claim/" + serverClaimId));
+    persistTasks(responseBundle, claimResponse);
 
     claimResponse.setId((String) null);
     DaoMethodOutcome crOutcome = daoRegistry.getResourceDao(ClaimResponse.class)
@@ -209,6 +232,7 @@ public class PasSubmitService {
     }
     boolean awaitsDocumentation = persistDocumentationRequestsAndAwaits(
         responseBundle, existingCr, anyStillPended);
+    persistTasks(responseBundle, existingCr);
 
     var crDao = daoRegistry.getResourceDao(ClaimResponse.class);
     crDao.update(existingCr, new SystemRequestDetails());
@@ -249,6 +273,58 @@ public class PasSubmitService {
     persistCommunicationRequests(responseBundle, claimResponse);
     syncItemTraceNumbers(responseBundle, claimResponse);
     return isPended && claimResponse.hasCommunicationRequest();
+  }
+
+  /**
+   * Stores the attachment-request Tasks carried in the response bundle, pointing them at the
+   * stored Claim the ClaimResponse is for. A Task shares its identifier with the
+   * CommunicationRequest asking for the same document; when that request was an existing open
+   * one, its Task is reused too.
+   */
+  private void persistTasks(Bundle responseBundle, ClaimResponse claimResponse) {
+    var taskDao = daoRegistry.getResourceDao(Task.class);
+    for (Bundle.BundleEntryComponent entry : responseBundle.getEntry()) {
+      if (!(entry.getResource() instanceof Task task)
+          || (entry.getFullUrl() != null && !entry.getFullUrl().startsWith("urn:uuid:"))) {
+        continue;
+      }
+      adoptCommunicationRequestIdentifier(task, responseBundle);
+      task.setReasonReference(claimResponse.getRequest().copy());
+
+      Identifier identifier = task.getIdentifierFirstRep();
+      SearchParameterMap params = new SearchParameterMap();
+      params.setLoadSynchronous(true);
+      params.add("identifier", new TokenParam(identifier.getSystem(), identifier.getValue()));
+      Task stored = taskDao.searchForResources(params, new SystemRequestDetails()).stream()
+          .map(Task.class::cast)
+          .filter(existing -> existing.getStatus() != Task.TaskStatus.COMPLETED)
+          .findFirst()
+          .orElse(null);
+      if (stored == null) {
+        task.setId((String) null);
+        String id = taskDao.create(task, new SystemRequestDetails()).getId().getIdPart();
+        task.setId(id);
+        stored = task;
+      }
+      entry.setResource(stored);
+      String fullUrl = FhirUtil.buildVersionlessResourceUrl(
+          serverBase, "Task", stored.getIdElement().getIdPart());
+      if (fullUrl != null) {
+        entry.setFullUrl(fullUrl);
+      }
+    }
+  }
+
+  /** After request dedup, a Task takes the identifier of the request asking for the same thing. */
+  private void adoptCommunicationRequestIdentifier(Task task, Bundle responseBundle) {
+    String key = PasTaskBuilder.documentKey(task);
+    for (Bundle.BundleEntryComponent entry : responseBundle.getEntry()) {
+      if (entry.getResource() instanceof CommunicationRequest cr && key != null
+          && key.equals(documentationRequestKey(cr)) && cr.hasIdentifier()) {
+        PasTaskBuilder.setTraceNumber(task, cr.getIdentifierFirstRep());
+        return;
+      }
+    }
   }
 
   /**
@@ -466,7 +542,9 @@ public class PasSubmitService {
   }
 
   private String questionnaireKey(String canonical) {
-    Questionnaire questionnaire = FhirUtil.resolveByCanonical(daoRegistry, Questionnaire.class, canonical);
+    // A provider may name the questionnaire by the address it was given for it
+    Questionnaire questionnaire = FhirUtil.resolveByCanonical(daoRegistry, Questionnaire.class,
+        responseBuilder.questionnaireCanonical(canonical));
     return questionnaire != null ? questionnaire.getIdElement().getIdPart() : null;
   }
 
@@ -510,12 +588,24 @@ public class PasSubmitService {
       Coverage coverage, String patientId, Bundle requestBundle) {
     Map<Integer, CoverageDecision> itemDecisions = new LinkedHashMap<>();
     for (Claim.ItemComponent item : claim.getItem()) {
-      Coding orderCode = item.getProductOrService().getCodingFirstRep();
-      CoverageDecision decision = evaluator.evaluate(
-          orderCode, payorIdentifiers, coverage, patientId, requestBundle);
-      itemDecisions.put(item.getSequence(), decision);
+      itemDecisions.put(item.getSequence(),
+          evaluateItem(item, payorIdentifiers, coverage, patientId, requestBundle));
     }
     return new SubmissionResult(itemDecisions, null);
+  }
+
+  /**
+   * Decides one Claim item: a configured demo outcome when its code has one, otherwise the
+   * CRD PlanDefinition evaluation.
+   */
+  private CoverageDecision evaluateItem(Claim.ItemComponent item, List<Identifier> payorIdentifiers,
+      Coverage coverage, String patientId, Bundle requestBundle) {
+    CoverageDecision demoDecision = demoOutcomes.decisionFor(item);
+    if (demoDecision != null) {
+      return demoDecision;
+    }
+    Coding orderCode = item.getProductOrService().getCodingFirstRep();
+    return evaluator.evaluate(orderCode, payorIdentifiers, coverage, patientId, requestBundle);
   }
 
   /**
@@ -534,22 +624,10 @@ public class PasSubmitService {
    */
   private SubmissionResult handleUpdate(Claim claim, List<Identifier> payorIdentifiers,
       Coverage coverage, String patientId, Bundle requestBundle) {
-    Claim storedPriorClaim = resolvePriorClaim(claim, requestBundle);
-    if (storedPriorClaim == null) {
+    ClaimResponse prior = findPriorAuthorization(claim, requestBundle);
+    if (isDenied(prior)) {
       throw new IllegalArgumentException(
-          "No stored authorization found matching the prior Claim identifier");
-    }
-
-    ClaimResponse prior = findPriorClaimResponse(storedPriorClaim);
-    if (prior == null) {
-      throw new IllegalArgumentException(
-          "Prior authorization ClaimResponse not found for the stored Claim");
-    }
-
-    String priorOverallCode = getMostRestrictiveReviewCode(prior);
-    if (REVIEW_CODE_A2.equals(priorOverallCode)) {
-      throw new IllegalArgumentException(
-          "Cannot update a denied prior authorization (review action A2)");
+          "Cannot update a denied prior authorization (review action A3)");
     }
 
     // Build prior decision map by item sequence
@@ -568,20 +646,18 @@ public class PasSubmitService {
       if (hasInfoCancelled(item)) {
         // infoCancelled takes precedence
         itemDecisions.put(seq, new CoverageDecision(
-            REVIEW_CODE_A2, "Not Certified", false));
+            REVIEW_CODE_A3, "Not Certified", false));
       } else if (hasInfoChanged(item)) {
-        Coding orderCode = item.getProductOrService().getCodingFirstRep();
-        CoverageDecision decision = evaluator.evaluate(
-            orderCode, payorIdentifiers, coverage, patientId, requestBundle);
-        itemDecisions.put(seq, decision);
+        itemDecisions.put(seq,
+            evaluateItem(item, payorIdentifiers, coverage, patientId, requestBundle));
       } else {
         // Unchanged: leave existing prior item unchanged to preserve prior decision state
         // (including existing authorization numbers). If this sequence wasn't on the
-        // prior authorization, add a default A3 decision.
+        // prior authorization, add a default NA decision.
         String priorCode = priorDecisionMap.get(seq);
         if (priorCode == null) {
           itemDecisions.put(seq, new CoverageDecision(
-              REVIEW_CODE_A3, "Not Required", false));
+              REVIEW_CODE_NA, "Not Required", false));
         }
       }
     }
@@ -590,33 +666,21 @@ public class PasSubmitService {
 
   /**
    * Handles whole-authorization cancel submissions. All items in the prior ClaimResponse
-   * receive A2 (Not Certified) regardless of what items the cancel Claim lists.
+   * receive A3 (Not Certified) regardless of what items the cancel Claim lists.
    * This reflects that cancel affects the entire existing authorization.
    */
   private SubmissionResult handleCancel(Claim claim, Bundle requestBundle) {
-    Claim storedPriorClaim = resolvePriorClaim(claim, requestBundle);
-    if (storedPriorClaim == null) {
+    ClaimResponse prior = findPriorAuthorization(claim, requestBundle);
+    if (isDenied(prior)) {
       throw new IllegalArgumentException(
-          "No stored authorization found matching the prior Claim identifier");
-    }
-
-    ClaimResponse prior = findPriorClaimResponse(storedPriorClaim);
-    if (prior == null) {
-      throw new IllegalArgumentException(
-          "Prior authorization ClaimResponse not found for the stored Claim");
-    }
-
-    String priorOverallCode = getMostRestrictiveReviewCode(prior);
-    if (REVIEW_CODE_A2.equals(priorOverallCode)) {
-      throw new IllegalArgumentException(
-          "Cannot cancel a denied prior authorization (review action A2)");
+          "Cannot cancel a denied prior authorization (review action A3)");
     }
 
     // Cancel all items in the existing authorization, not just items on the cancel Claim
     Map<Integer, CoverageDecision> itemDecisions = new LinkedHashMap<>();
     for (ClaimResponse.ItemComponent item : prior.getItem()) {
       itemDecisions.put(item.getItemSequence(), new CoverageDecision(
-          REVIEW_CODE_A2, "Not Certified", false));
+          REVIEW_CODE_A3, "Not Certified", false));
     }
     return new SubmissionResult(itemDecisions, prior);
   }
@@ -624,15 +688,61 @@ public class PasSubmitService {
   // ===== Prior Authorization Lookup =====
 
   /**
-   * Resolves the prior Claim to a stored copy on this server. The provider's prior Claim
-   * is included in the bundle but uses the provider's resource ID. The linkage
+   * Finds the authorization a Claim update or cancel applies to. Every submission stores its
+   * Claim, but an update changes the existing ClaimResponse in place, so only the Claim that
+   * opened the authorization is that ClaimResponse's request. The provider's prior Claim may
+   * itself be an earlier update sharing the same identifier, so the stored Claims with that
+   * identifier are tried newest first and the first one with a ClaimResponse is the
+   * authorization.
+   *
+   * @throws IllegalArgumentException if no stored Claim or no authorization matches
+   */
+  private ClaimResponse findPriorAuthorization(Claim claim, Bundle requestBundle) {
+    List<Claim> storedClaims = resolvePriorClaims(claim, requestBundle);
+    if (storedClaims.isEmpty()) {
+      throw new IllegalArgumentException(
+          "No stored authorization found matching the prior Claim identifier");
+    }
+    for (Claim storedClaim : storedClaims) {
+      ClaimResponse prior = findPriorClaimResponse(storedClaim);
+      if (prior != null) {
+        return prior;
+      }
+    }
+    throw new IllegalArgumentException(
+        "Prior authorization ClaimResponse not found for the stored Claim");
+  }
+
+  /**
+   * A denied request, which the PAS IG does not allow to be updated or cancelled, is one where
+   * no line was certified: every line carries A3. A line cancelled by an earlier update is also
+   * A3, but the rest of the authorization stays open to further changes.
+   */
+  private boolean isDenied(ClaimResponse claimResponse) {
+    boolean anyDecided = false;
+    for (ClaimResponse.ItemComponent item : claimResponse.getItem()) {
+      String code = PasExtensions.extractReviewActionCode(item);
+      if (code == null) {
+        continue;
+      }
+      if (!REVIEW_CODE_A3.equals(code)) {
+        return false;
+      }
+      anyDecided = true;
+    }
+    return anyDecided;
+  }
+
+  /**
+   * Resolves the prior Claim to its stored copies on this server, newest first. The provider's
+   * prior Claim is included in the bundle but uses the provider's resource ID. The linkage
    * to our stored copy is through Claim.identifier, which is required on the
    * PAS Claim profile and preserved across both systems.
    *
-   * @return the stored Claim, or null if no matching stored Claim found
+   * @return the stored Claims with the prior Claim's identifier, newest first (possibly empty)
    * @throws IllegalArgumentException if the prior Claim is missing from the bundle or has no identifier
    */
-  private Claim resolvePriorClaim(Claim claim, Bundle bundle) {
+  private List<Claim> resolvePriorClaims(Claim claim, Bundle bundle) {
     String priorClaimRef = claim.getRelatedFirstRep().getClaim().getReference();
     Claim priorInBundle = ResourceResolver.findInBundle(priorClaimRef, Claim.class, bundle);
     if (priorInBundle == null) {
@@ -650,12 +760,12 @@ public class PasSubmitService {
     params.add("identifier", new TokenParam(traceId.getSystem(), traceId.getValue()));
     params.setSort(new ca.uhn.fhir.rest.api.SortSpec("_lastUpdated",
         ca.uhn.fhir.rest.api.SortOrderEnum.DESC));
-    params.setCount(1);
+    params.setCount(PRIOR_CLAIM_SEARCH_LIMIT);
     return daoRegistry.getResourceDao(Claim.class)
         .searchForResources(params, new SystemRequestDetails())
         .stream()
-        .findFirst()
-        .orElse(null);
+        .map(Claim.class::cast)
+        .toList();
   }
 
   /**
@@ -707,7 +817,7 @@ public class PasSubmitService {
   }
 
   private String getMostRestrictiveReviewCode(ClaimResponse claimResponse) {
-    String worstCode = REVIEW_CODE_A3;
+    String worstCode = REVIEW_CODE_NA;
     int worstRank = 1;
 
     for (ClaimResponse.ItemComponent item : claimResponse.getItem()) {
@@ -725,10 +835,10 @@ public class PasSubmitService {
 
   private int rankReviewCode(String code) {
     return switch (code) {
-      case REVIEW_CODE_A2 -> 4;
+      case REVIEW_CODE_A3 -> 4;
       case REVIEW_CODE_A4 -> 3;
       case REVIEW_CODE_A1 -> 2;
-      default -> 1; // A3
+      default -> 1; // NA
     };
   }
 

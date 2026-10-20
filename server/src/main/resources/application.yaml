@@ -529,3 +529,13 @@ pas:
   pended-resolution-delay-seconds: 15
   authorization-number-prefix: "AUTH-"
   resthook-inbox-max-size: 100
+  demo:
+    # Procedure codes (Claim.item.productOrService) that switch on decisions no coverage rule
+    # produces yet, so every kind of PAS response can be exercised (e.g. by Inferno):
+    #   modified - certified with changes (A6), half the requested units, returned as addItem
+    #   document - pended (A4) for a plan of care note requested by LOINC code, with a PAS Task
+    #   error    - rejected with ClaimResponse.error (X12 AAA), nothing stored
+    outcomes:
+      "42": modified
+      PT: document
+      "6": error

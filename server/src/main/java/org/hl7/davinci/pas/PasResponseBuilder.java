@@ -2,6 +2,7 @@ package org.hl7.davinci.pas;
 
 import static org.hl7.davinci.common.FhirConstants.*;
 
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
@@ -16,29 +17,41 @@ import java.util.function.Function;
 import org.hl7.davinci.common.FhirUtil;
 import org.hl7.davinci.common.ResourceResolver;
 import org.hl7.davinci.pas.PasCoverageEvaluator.CoverageDecision;
+import org.hl7.fhir.r4.model.BooleanType;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Claim;
 import org.hl7.fhir.r4.model.ClaimResponse;
+import org.hl7.fhir.r4.model.CodeType;
 import org.hl7.fhir.r4.model.CodeableConcept;
 import org.hl7.fhir.r4.model.Coding;
 import org.hl7.fhir.r4.model.CommunicationRequest;
+import org.hl7.fhir.r4.model.DateType;
 import org.hl7.fhir.r4.model.Extension;
 import org.hl7.fhir.r4.model.IdType;
 import org.hl7.fhir.r4.model.Identifier;
+import org.hl7.fhir.r4.model.Organization;
 import org.hl7.fhir.r4.model.Parameters;
 import org.hl7.fhir.r4.model.Period;
+import org.hl7.fhir.r4.model.PositiveIntType;
+import org.hl7.fhir.r4.model.PractitionerRole;
+import org.hl7.fhir.r4.model.Quantity;
 import org.hl7.fhir.r4.model.Questionnaire;
 import org.hl7.fhir.r4.model.Reference;
 import org.hl7.fhir.r4.model.Resource;
+import org.hl7.fhir.r4.model.SimpleQuantity;
 import org.hl7.fhir.r4.model.StringType;
+import org.hl7.fhir.r4.model.Task;
 import org.hl7.fhir.r4.model.Type;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import ca.uhn.fhir.context.FhirContext;
 import ca.uhn.fhir.jpa.api.dao.DaoRegistry;
+import ca.uhn.fhir.jpa.searchparam.SearchParameterMap;
 import ca.uhn.fhir.jpa.starter.AppProperties;
 import ca.uhn.fhir.rest.api.server.SystemRequestDetails;
+import ca.uhn.fhir.rest.param.ReferenceParam;
 import ca.uhn.fhir.rest.server.exceptions.ResourceNotFoundException;
 
 /**
@@ -56,10 +69,33 @@ public class PasResponseBuilder {
   private final AtomicLong traceCounter = new AtomicLong(0);
   private final String serverBase;
   private final DaoRegistry daoRegistry;
+  private final PasQuestionnaireAddresses questionnaireAddresses;
 
   public PasResponseBuilder(AppProperties appProperties, DaoRegistry daoRegistry) {
     this.serverBase = FhirUtil.normalizeServerBase(appProperties.getServer_address());
     this.daoRegistry = daoRegistry;
+    this.questionnaireAddresses = new PasQuestionnaireAddresses(appProperties, daoRegistry);
+  }
+
+  /**
+   * Readies a response Bundle for the provider: documentation requests name their questionnaire
+   * the way providers see it (see {@link PasQuestionnaireAddresses}). The Bundle's resources must
+   * be copies, not the stored instances.
+   */
+  public Bundle presentToProvider(Bundle bundle) {
+    if (bundle != null) {
+      for (Bundle.BundleEntryComponent entry : bundle.getEntry()) {
+        if (entry.getResource() instanceof CommunicationRequest request) {
+          questionnaireAddresses.presentToProvider(request);
+        }
+      }
+    }
+    return bundle;
+  }
+
+  /** The canonical a questionnaire reference from a provider stands for. */
+  public String questionnaireCanonical(String reference) {
+    return questionnaireAddresses.canonicalOf(reference);
   }
 
   /**
@@ -86,7 +122,8 @@ public class PasResponseBuilder {
   }
 
   /**
-   * Builds a Parameters resource wrapping each matching ClaimResponse in a "responseBundle" parameter.
+   * Builds a Parameters resource wrapping each matching ClaimResponse in a "return" parameter,
+   * the output parameter of the PAS Claim/$inquire OperationDefinition.
    * Per PAS IG narrative/examples for $inquire output.
    */
   public Parameters buildInquiryResponse(List<ClaimResponse> matches) {
@@ -96,9 +133,12 @@ public class PasResponseBuilder {
       Bundle responseBundle = wrapInResponseBundle(sanitized);
       responseBundle.getMeta().getProfile().clear();
       responseBundle.getMeta().addProfile(PasConstants.PROFILE_PAS_INQUIRY_RESPONSE_BUNDLE);
-      addReferencedCommunicationRequests(responseBundle, sanitized,
-          ref -> readReferencedResource(ref, daoRegistry));
-      params.addParameter().setName("responseBundle").setResource(responseBundle);
+      Function<Reference, Resource> resolver = ref -> readReferencedResource(ref, daoRegistry);
+      addReferencedResources(responseBundle, sanitized, resolver);
+      addReferencedCommunicationRequests(responseBundle, sanitized, resolver);
+      addSupportingResources(responseBundle, sanitized, resolver);
+      presentToProvider(responseBundle);
+      params.addParameter().setName("return").setResource(responseBundle);
     }
     return params;
   }
@@ -205,6 +245,14 @@ public class PasResponseBuilder {
         newItem.addExtension(PasConstants.ADMIN_REF_NUMBER, new StringType(adminRef));
       }
     }
+
+    for (ClaimResponse.ItemComponent item : claimResponse.getItem()) {
+      CoverageDecision decision = itemDecisions.get(item.getItemSequence());
+      if (decision != null) {
+        noteDecision(claimResponse, item, decision);
+      }
+    }
+    refreshDecisionSummary(claimResponse);
   }
 
   /**
@@ -213,12 +261,19 @@ public class PasResponseBuilder {
    */
   public Bundle buildNotificationResponseBundle(ClaimResponse claimResponse, DaoRegistry daoRegistry) {
     ClaimResponse sanitized = sanitizeForBundle(claimResponse);
+    // The communicatedDiagnosis extension is sliced onto ClaimResponse.item by the PAS profile but
+    // its own context does not list that element, and notification validators reject it there.
+    // A decision update does not need the diagnosis echo, so it stays on $submit replies only.
+    for (ClaimResponse.ItemComponent item : sanitized.getItem()) {
+      item.getExtension().removeIf(e -> PasConstants.EXT_COMMUNICATED_DIAGNOSIS.equals(e.getUrl()));
+    }
     Bundle bundle = wrapInResponseBundle(sanitized);
 
     Function<Reference, Resource> resolver = ref -> readReferencedResource(ref, daoRegistry);
     addReferencedResources(bundle, sanitized, resolver);
     addReferencedCommunicationRequests(bundle, sanitized, resolver);
 
+    presentToProvider(bundle);
     return bundle;
   }
 
@@ -234,8 +289,8 @@ public class PasResponseBuilder {
         return null;
       }
 
-      return (Resource) daoRegistry.getResourceDao(resourceType)
-          .read(refId, new SystemRequestDetails());
+      var dao = daoRegistry.getResourceDao(resourceType);
+      return dao == null ? null : (Resource) dao.read(refId, new SystemRequestDetails());
     } catch (ResourceNotFoundException e) {
       // Referenced resource no longer exists; skip it
       return null;
@@ -248,7 +303,15 @@ public class PasResponseBuilder {
    * Resolves an Organization reference from a bundle and returns its first NPI value, or null.
    */
   private String resolveNpiFromBundle(Reference ref, Bundle bundle) {
-    return PasBundleReferenceResolver.findOrganizationNpiInBundle(bundle, ref);
+    String npi = PasBundleReferenceResolver.findOrganizationNpiInBundle(bundle, ref);
+    if (npi != null || ref == null || !ref.hasReference()) {
+      return npi;
+    }
+    // By the time the response is built the Claim points at the payer's stored Organization,
+    // which is no longer findable in the request Bundle under that reference.
+    return readReferencedResource(ref, daoRegistry) instanceof Organization organization
+        ? PasBundleReferenceResolver.extractNpiValue(organization)
+        : null;
   }
 
   private void finalizePendedItems(ClaimResponse claimResponse,
@@ -271,8 +334,11 @@ public class PasResponseBuilder {
         if (item.getExtensionByUrl(PasConstants.ITEM_PREAUTH_PERIOD) == null) {
           item.addExtension(buildDefaultPreAuthPeriod());
         }
+        noteDecision(claimResponse, item,
+            new CoverageDecision(targetCode, targetDisplay, false));
       }
     }
+    refreshDecisionSummary(claimResponse);
 
     // Update outcome: if no pended items remain, mark as complete
     boolean stillPended = claimResponse.getItem().stream()
@@ -280,6 +346,47 @@ public class PasResponseBuilder {
         .anyMatch(this::isPendedReviewAction);
     if (!stillPended) {
       claimResponse.setOutcome(ClaimResponse.RemittanceOutcome.COMPLETE);
+    }
+  }
+
+  /**
+   * Identifiers, reviewer and transmission identifiers shared by every ClaimResponse built for a
+   * request. The payer's own trace number comes first; the provider's trace numbers for the request
+   * are echoed after it, as X12 278 responses return the requester's TRN.
+   */
+  private void addHeader(ClaimResponse cr, Claim requestClaim, Bundle requestBundle) {
+    // CR-level identifier (PASIdentifier profile)
+    cr.addIdentifier(new Identifier()
+        .setSystem(identifierSystem("patient-event-trace-number"))
+        .setValue(UUID.randomUUID().toString()));
+    for (Identifier requestIdentifier : requestClaim.getIdentifier()) {
+      Identifier echoed = requestIdentifier.copy();
+      echoed.getExtension().removeIf(e -> !PasConstants.IDENTIFIER_SUB_DEPARTMENT.equals(e.getUrl())
+          && !PasConstants.IDENTIFIER_JURISDICTION.equals(e.getUrl()));
+      cr.addIdentifier(echoed);
+    }
+
+    // Decisions are made by rule, not by a human reviewer
+    Extension reviewer = new Extension(PasConstants.CLAIM_RESPONSE_REVIEWER);
+    reviewer.addExtension("wasHumanReviewedFlag", new BooleanType(false));
+    cr.addExtension(reviewer);
+
+    // Reverse TransmissionIdentifiers for the response (payer is now sender, provider is receiver)
+    Extension requestTransmissionIds = PasExtensions.extractTransmissionIdentifiers(requestClaim);
+    if (requestTransmissionIds != null) {
+      String requestSender = PasExtensions.extractApplicationSenderCode(requestClaim);
+      String requestReceiver = PasExtensions.extractApplicationReceiverCode(requestClaim);
+      cr.addExtension(PasExtensions.buildTransmissionIdentifiersExtension(
+          requestReceiver != null ? requestReceiver : "",
+          requestSender != null ? requestSender : ""));
+    } else {
+      String providerNpi = resolveNpiFromBundle(requestClaim.getProvider(), requestBundle);
+      String insurerNpi = resolveNpiFromBundle(requestClaim.getInsurer(), requestBundle);
+      if (providerNpi != null || insurerNpi != null) {
+        cr.addExtension(PasExtensions.buildTransmissionIdentifiersExtension(
+            insurerNpi != null ? insurerNpi : "",
+            providerNpi != null ? providerNpi : ""));
+      }
     }
   }
 
@@ -306,28 +413,7 @@ public class PasResponseBuilder {
       cr.setRequest(new Reference("Claim/" + claimId));
     }
 
-    // CR-level identifier (PASIdentifier profile)
-    cr.addIdentifier(new Identifier()
-        .setSystem("http://example.org/PATIENT_EVENT_TRACE_NUMBER")
-        .setValue(UUID.randomUUID().toString()));
-
-    // Reverse TransmissionIdentifiers for the response (payer is now sender, provider is receiver)
-    Extension requestTransmissionIds = PasExtensions.extractTransmissionIdentifiers(requestClaim);
-    if (requestTransmissionIds != null) {
-      String requestSender = PasExtensions.extractApplicationSenderCode(requestClaim);
-      String requestReceiver = PasExtensions.extractApplicationReceiverCode(requestClaim);
-      cr.addExtension(PasExtensions.buildTransmissionIdentifiersExtension(
-          requestReceiver != null ? requestReceiver : "",
-          requestSender != null ? requestSender : ""));
-    } else {
-      String providerNpi = resolveNpiFromBundle(requestClaim.getProvider(), requestBundle);
-      String insurerNpi = resolveNpiFromBundle(requestClaim.getInsurer(), requestBundle);
-      if (providerNpi != null || insurerNpi != null) {
-        cr.addExtension(PasExtensions.buildTransmissionIdentifiersExtension(
-            insurerNpi != null ? insurerNpi : "",
-            providerNpi != null ? providerNpi : ""));
-      }
-    }
+    addHeader(cr, requestClaim, requestBundle);
 
     Map<Integer, String> itemAuthNumbers = new HashMap<>();
 
@@ -335,7 +421,7 @@ public class PasResponseBuilder {
     for (Claim.ItemComponent requestItem : requestClaim.getItem()) {
       int seq = requestItem.getSequence();
       CoverageDecision decision = itemDecisions.getOrDefault(seq,
-          new CoverageDecision(REVIEW_CODE_A3, "Not Required", false));
+          new CoverageDecision(REVIEW_CODE_NA, "Not Required", false));
 
       ClaimResponse.ItemComponent responseItem = cr.addItem();
       responseItem.setItemSequence(seq);
@@ -380,33 +466,352 @@ public class PasResponseBuilder {
         String adminRef = authNumberPrefix + "PEND" + String.format("%04d", pendCounter.incrementAndGet());
         responseItem.addExtension(PasConstants.ADMIN_REF_NUMBER, new StringType(adminRef));
       }
+
+      echoLineContext(responseItem, requestItem, requestClaim);
+      if (includeAuthNumber) {
+        Reference authorized = authorizedParty(lineProvider(requestClaim, requestItem), requestBundle);
+        if (authorized != null) {
+          responseItem.addExtension(authorizedProviderExtension(authorized));
+        }
+        responseItem.addExtension(authorizedDetailExtension(requestItem, decision));
+      }
+      noteDecision(cr, responseItem, decision);
     }
 
     // addItem entries for A6 (Modified) decisions with modifications
     for (Map.Entry<Integer, CoverageDecision> entry : itemDecisions.entrySet()) {
       CoverageDecision decision = entry.getValue();
       if (REVIEW_CODE_A6.equals(decision.reviewActionCode()) && decision.hasModification()) {
-        ClaimResponse.AddedItemComponent addItem = cr.addAddItem();
-        addItem.addItemSequence(entry.getKey());
-        if (decision.modifiedProductOrService() != null) {
-          addItem.setProductOrService(decision.modifiedProductOrService());
-        }
-        if (decision.modifiedQuantity() != null) {
-          addItem.setQuantity(decision.modifiedQuantity());
-        }
         String authNumber = itemAuthNumbers.get(entry.getKey());
         if (authNumber == null) {
           authNumber = nextAuthorizationNumber(authNumberPrefix);
         }
-        ClaimResponse.AdjudicationComponent addItemAdj = addItem.addAdjudication();
-        addItemAdj.setCategory(new CodeableConcept().addCoding(
-            new Coding(ADJUDICATION_SYSTEM, "submitted", "Submitted Amount")));
-        addItemAdj.addExtension(PasExtensions.buildReviewActionExtension(
-            REVIEW_CODE_A6, "Modified", authNumber));
+        Claim.ItemComponent requestItem = requestClaim.getItem().stream()
+            .filter(item -> item.getSequence() == entry.getKey())
+            .findFirst()
+            .orElse(null);
+        addModifiedLine(cr, requestClaim, requestBundle, requestItem, entry.getKey(), decision, authNumber);
       }
     }
 
+    refreshDecisionSummary(cr);
+
     return cr;
+  }
+
+  // ===== Decision detail =====
+
+  /**
+   * Carries the requested line's context onto its decision: the authorization number the
+   * provider cited, the admission and discharge dates of the stay, and the line's diagnosis.
+   */
+  private void echoLineContext(ClaimResponse.ItemComponent responseItem, Claim.ItemComponent requestItem,
+      Claim requestClaim) {
+    Extension cited = requestItem.getExtensionByUrl(PasConstants.AUTHORIZATION_NUMBER);
+    if (cited != null && cited.hasValue()) {
+      responseItem.addExtension(cited.copy());
+    }
+    for (Extension stay : stayDates(requestClaim)) {
+      responseItem.addExtension(stay);
+    }
+    CodeableConcept diagnosis = lineDiagnosis(requestClaim, requestItem);
+    if (diagnosis != null) {
+      responseItem.addExtension(PasConstants.EXT_COMMUNICATED_DIAGNOSIS, diagnosis);
+    }
+  }
+
+  /** admissionDates / dischargeDate extensions from the Claim's supportingInfo, when it has them. */
+  private static List<Extension> stayDates(Claim claim) {
+    List<Extension> dates = new ArrayList<>();
+    for (Claim.SupportingInformationComponent info : claim.getSupportingInfo()) {
+      String category = info.getCategory().getCodingFirstRep().getCode();
+      if ("admissionDates".equals(category) && info.hasTiming()) {
+        dates.add(new Extension(PasConstants.ADMISSION_DATES, info.getTiming().copy()));
+      } else if ("dischargeDates".equals(category) && info.getTiming() instanceof DateType date) {
+        dates.add(new Extension(PasConstants.DISCHARGE_DATE, date.copy()));
+      }
+    }
+    return dates;
+  }
+
+  /** The diagnosis the line points at through diagnosisSequence, else the Claim's first one. */
+  private static CodeableConcept lineDiagnosis(Claim claim, Claim.ItemComponent item) {
+    for (PositiveIntType sequence : item.getDiagnosisSequence()) {
+      for (Claim.DiagnosisComponent diagnosis : claim.getDiagnosis()) {
+        if (diagnosis.getSequence() == sequence.getValue() && diagnosis.hasDiagnosisCodeableConcept()) {
+          return diagnosis.getDiagnosisCodeableConcept().copy();
+        }
+      }
+    }
+    return claim.getDiagnosisFirstRep().hasDiagnosisCodeableConcept()
+        ? claim.getDiagnosisFirstRep().getDiagnosisCodeableConcept().copy()
+        : null;
+  }
+
+  /** The care-team member the line names, else the requesting provider. */
+  private static Reference lineProvider(Claim claim, Claim.ItemComponent item) {
+    for (PositiveIntType sequence : item.getCareTeamSequence()) {
+      for (Claim.CareTeamComponent member : claim.getCareTeam()) {
+        if (member.getSequence() == sequence.getValue() && member.getProvider().hasReference()) {
+          return member.getProvider().copy();
+        }
+      }
+    }
+    return claim.getProvider().copy();
+  }
+
+  /**
+   * Authorizations name a Practitioner or an Organization. A PractitionerRole stands for the
+   * Practitioner it names; anything that cannot be resolved that way is not named at all.
+   */
+  private Reference authorizedParty(Reference provider, Bundle requestBundle) {
+    String reference = provider.getReference();
+    if (reference == null) {
+      return null;
+    }
+    if (!reference.contains("PractitionerRole/")
+        && (reference.contains("Practitioner/") || reference.contains("Organization/"))) {
+      return provider.copy();
+    }
+    PractitionerRole role = requestBundle != null
+        ? ResourceResolver.findInBundle(reference, PractitionerRole.class, requestBundle)
+        : null;
+    if (role == null && readReferencedResource(provider, daoRegistry) instanceof PractitionerRole stored) {
+      role = stored;
+    }
+    return role != null && role.getPractitioner().hasReference() ? role.getPractitioner().copy() : null;
+  }
+
+  private static Extension authorizedProviderExtension(Reference provider) {
+    Extension authorized = new Extension(PasConstants.ITEM_AUTHORIZED_PROVIDER);
+    authorized.addExtension("provider", provider);
+    return authorized;
+  }
+
+  /** What was authorized for the line: the service, its modifiers, units and price. */
+  private static Extension authorizedDetailExtension(Claim.ItemComponent requestItem,
+      CoverageDecision decision) {
+    Extension detail = new Extension(PasConstants.ITEM_AUTHORIZED_DETAIL);
+    CodeableConcept service = decision.modifiedProductOrService() != null
+        ? decision.modifiedProductOrService()
+        : requestItem.getProductOrService();
+    if (!service.isEmpty()) {
+      detail.addExtension("productOrServiceCode", service.copy());
+    }
+    for (CodeableConcept modifier : requestItem.getModifier()) {
+      detail.addExtension("modifier", modifier.copy());
+    }
+    if (requestItem.hasUnitPrice()) {
+      detail.addExtension("unitPrice", requestItem.getUnitPrice().copy());
+    }
+    Quantity quantity = decision.modifiedQuantity() != null ? decision.modifiedQuantity() : requestItem.getQuantity();
+    if (quantity != null && !quantity.isEmpty()) {
+      // value[x] is Quantity; a SimpleQuantity would be written as the invalid valueSimpleQuantity
+      Quantity authorized = new Quantity();
+      quantity.copyValues(authorized);
+      detail.addExtension("quantity", authorized);
+    }
+    return detail;
+  }
+
+  /**
+   * A modified (A6) decision returns the line as authorized: the requested line with the payer's
+   * change applied, carrying the request's line details, the authorization and its period.
+   */
+  private void addModifiedLine(ClaimResponse cr, Claim requestClaim, Bundle requestBundle,
+      Claim.ItemComponent requestItem, int sequence, CoverageDecision decision, String authNumber) {
+    ClaimResponse.AddedItemComponent addItem = cr.addAddItem();
+    addItem.addItemSequence(sequence);
+
+    if (requestItem != null) {
+      for (Extension ext : requestItem.getExtension()) {
+        if (ADDED_ITEM_ECHOED_EXTENSIONS.contains(ext.getUrl())) {
+          addItem.addExtension(ext.copy());
+        }
+      }
+      if (requestItem.hasRevenue()) {
+        addItem.addExtension(PasConstants.REVENUE_CODE, requestItem.getRevenue().copy());
+      }
+      Reference provider = authorizedParty(lineProvider(requestClaim, requestItem), requestBundle);
+      if (provider != null) {
+        provider.addExtension(PasConstants.AUTHORIZED_PROVIDER_TYPE, new CodeableConcept().addCoding(
+            new Coding(PasConstants.X12_ENTITY_IDENTIFIER_SYSTEM, "SJ", "Service Provider")));
+        addItem.addProvider(provider);
+      }
+      addItem.setProductOrService(requestItem.getProductOrService().copy());
+      requestItem.getModifier().forEach(modifier -> addItem.addModifier(modifier.copy()));
+      if (requestItem.hasServiced()) {
+        addItem.setServiced(requestItem.getServiced().copy());
+      }
+      if (requestItem.hasLocation()) {
+        addItem.setLocation(requestItem.getLocation().copy());
+      }
+      if (requestItem.hasQuantity()) {
+        addItem.setQuantity(requestItem.getQuantity().copy());
+      }
+      if (requestItem.hasUnitPrice()) {
+        addItem.setUnitPrice(requestItem.getUnitPrice().copy());
+      }
+    }
+    addItem.addExtension(PasExtensions.buildPreAuthIssueDateExtension(new Date()));
+    addItem.addExtension(buildDefaultPreAuthPeriod());
+    stayDates(requestClaim).forEach(addItem::addExtension);
+
+    if (decision.modifiedProductOrService() != null) {
+      addItem.setProductOrService(decision.modifiedProductOrService().copy());
+    }
+    if (decision.modifiedQuantity() != null) {
+      SimpleQuantity modified = decision.modifiedQuantity();
+      if (addItem.hasQuantity() && !modified.hasUnit() && !modified.hasCode()) {
+        // A bare number changes how many of the requested unit are authorized
+        addItem.getQuantity().setValue(modified.getValue());
+      } else {
+        addItem.setQuantity(modified.copy());
+      }
+    }
+
+    ClaimResponse.AdjudicationComponent addItemAdj = addItem.addAdjudication();
+    addItemAdj.setCategory(new CodeableConcept().addCoding(
+        new Coding(ADJUDICATION_SYSTEM, "submitted", "Submitted Amount")));
+    addItemAdj.addExtension(PasExtensions.buildReviewActionExtension(
+        REVIEW_CODE_A6, "Modified", authNumber));
+  }
+
+  /** Claim.item extensions that describe the service itself and so stay with a modified line. */
+  private static final Set<String> ADDED_ITEM_ECHOED_EXTENSIONS = Set.of(
+      PasConstants.ITEM_TRACE_NUMBER,
+      PasConstants.AUTHORIZATION_NUMBER,
+      PasConstants.ADMIN_REF_NUMBER,
+      PasConstants.EPSDT_INDICATOR,
+      PasConstants.NURSING_HOME_RESIDENTIAL_STATUS,
+      PasConstants.NURSING_HOME_LEVEL_OF_CARE,
+      PasConstants.PRODUCT_OR_SERVICE_CODE_END,
+      PasConstants.REVENUE_UNIT_RATE_LIMIT,
+      PasConstants.ITEM_REQUESTED_SERVICE,
+      PasConstants.SERVICE_ITEM_REQUEST_TYPE,
+      PasConstants.CERTIFICATION_TYPE);
+
+  /**
+   * Records why the line got its decision as a processNote and points the line at it. Earlier
+   * notes stay as the history of the request; the line references the current one.
+   */
+  private static void noteDecision(ClaimResponse cr, ClaimResponse.ItemComponent item,
+      CoverageDecision decision) {
+    String text = "Line " + item.getItemSequence() + ": " + switch (decision.reviewActionCode()) {
+      case REVIEW_CODE_A1 -> "certified in total.";
+      case REVIEW_CODE_A3 -> "not certified.";
+      case REVIEW_CODE_A4 -> decision.hasAdditionalDocumentationInfo()
+          ? "pended; additional documentation has been requested."
+          : "pended for review.";
+      case REVIEW_CODE_A6 -> decision.modifiedQuantity() != null && decision.modifiedQuantity().hasValue()
+          ? "certified with changes; " + decision.modifiedQuantity().getValue().toPlainString()
+              + " unit(s) authorized, see the added item."
+          : "certified with changes, see the added item.";
+      default -> "prior authorization is not required.";
+    };
+    int number = cr.getProcessNote().size() + 1;
+    cr.addProcessNote().setNumber(number).setText(text);
+    item.getNoteNumber().clear();
+    item.addNoteNumber(number);
+  }
+
+  /**
+   * Keeps the header in step with the lines: the authorization number of the request (as the
+   * header reviewAction, which carries only the number), the period covering the certified lines,
+   * and the provider they are authorized for.
+   */
+  private static void refreshDecisionSummary(ClaimResponse cr) {
+    String authorizationNumber = null;
+    Reference authorizedProvider = null;
+    List<Extension> periods = new ArrayList<>();
+    for (ClaimResponse.ItemComponent item : cr.getItem()) {
+      periods.addAll(item.getExtensionsByUrl(PasConstants.ITEM_PREAUTH_PERIOD));
+      if (authorizationNumber == null) {
+        authorizationNumber = PasExtensions.extractAuthorizationNumber(item);
+      }
+      Extension provider = item.getExtensionByUrl(PasConstants.ITEM_AUTHORIZED_PROVIDER);
+      if (authorizedProvider == null && provider != null
+          && provider.getExtensionByUrl("provider") != null
+          && provider.getExtensionByUrl("provider").getValue() instanceof Reference ref) {
+        authorizedProvider = ref.copy();
+      }
+    }
+    for (ClaimResponse.AddedItemComponent addItem : cr.getAddItem()) {
+      periods.addAll(addItem.getExtensionsByUrl(PasConstants.ITEM_PREAUTH_PERIOD));
+    }
+
+    cr.getAdjudication().clear();
+    if (authorizationNumber != null) {
+      Extension reviewAction = new Extension(PasConstants.REVIEW_ACTION);
+      reviewAction.addExtension("number", new StringType(authorizationNumber));
+      cr.addAdjudication()
+          .setCategory(new CodeableConcept().addCoding(
+              new Coding(ADJUDICATION_SYSTEM, "submitted", "Submitted Amount")))
+          .addExtension(reviewAction);
+    }
+
+    Date start = null;
+    Date end = null;
+    for (Extension ext : periods) {
+      if (ext.getValue() instanceof Period period) {
+        if (period.hasStart() && (start == null || period.getStart().before(start))) start = period.getStart();
+        if (period.hasEnd() && (end == null || period.getEnd().after(end))) end = period.getEnd();
+      }
+    }
+    cr.setPreAuthPeriod(start != null || end != null ? new Period().setStart(start).setEnd(end) : null);
+
+    cr.getExtension().removeIf(e -> PasConstants.ITEM_AUTHORIZED_PROVIDER.equals(e.getUrl()));
+    if (authorizedProvider != null) {
+      cr.addExtension(authorizedProviderExtension(authorizedProvider));
+    }
+  }
+
+  // ===== Rejected requests =====
+
+  /**
+   * Response for a request the payer will not decide on: a ClaimResponse with outcome error and
+   * one X12 AAA error per rejected line. No authorization (and no Claim) is stored for it, so
+   * ClaimResponse.request carries a data-absent reason and the entry has a urn:uuid fullUrl.
+   */
+  public Bundle buildErrorResponse(Claim requestClaim, Bundle requestBundle,
+      List<Claim.ItemComponent> rejectedItems) {
+    ClaimResponse cr = new ClaimResponse();
+    cr.setId(UUID.randomUUID().toString());
+    cr.getMeta().addProfile(PasConstants.PROFILE_PAS_CLAIM_RESPONSE);
+    cr.setStatus(ClaimResponse.ClaimResponseStatus.ACTIVE);
+    cr.setType(requestClaim.getType().copy());
+    cr.setUse(ClaimResponse.Use.PREAUTHORIZATION);
+    cr.setPatient(requestClaim.getPatient().copy());
+    cr.setCreated(new Date());
+    cr.setInsurer(requestClaim.getInsurer().copy());
+    cr.setRequestor(requestClaim.getProvider().copy());
+    cr.setOutcome(ClaimResponse.RemittanceOutcome.ERROR);
+    cr.getRequest().addExtension(PasConstants.DATA_ABSENT_REASON, new CodeType("not-applicable"));
+    addHeader(cr, requestClaim, requestBundle);
+
+    for (Claim.ItemComponent item : rejectedItems) {
+      int number = cr.getProcessNote().size() + 1;
+      String code = item.getProductOrService().getCodingFirstRep().getCode();
+      cr.addProcessNote().setNumber(number).setText("Line " + item.getSequence() + ": procedure code "
+          + code + " is not accepted for prior authorization. Correct the code and resubmit.");
+
+      ClaimResponse.ErrorComponent error = cr.addError();
+      error.setItemSequence(item.getSequence());
+      error.setCode(new CodeableConcept().addCoding(new Coding(PasConstants.X12_REJECT_REASON_SYSTEM,
+          "AG", "Invalid/Missing Procedure Code(s)")));
+      error.addExtension(PasConstants.ERROR_FOLLOWUP_ACTION, new CodeableConcept().addCoding(
+          new Coding(PasConstants.X12_FOLLOWUP_ACTION_SYSTEM, "C", "Please Correct and Resubmit")));
+      Extension element = new Extension(PasConstants.ERROR_ELEMENT);
+      element.addExtension("processNote", new PositiveIntType(number));
+      element.addExtension("error", new StringType("2000F-SV101"));
+      error.addExtension(element);
+      error.addExtension(PasConstants.ERROR_PATH, new StringType(
+          "Bundle.entry[0].Claim.item[" + requestClaim.getItem().indexOf(item) + "].productOrService"));
+    }
+
+    Bundle bundle = wrapInResponseBundle(cr, requestBundle);
+    bundle.getEntryFirstRep().setFullUrl("urn:uuid:" + cr.getIdElement().getIdPart());
+    return bundle;
   }
 
   Bundle wrapInResponseBundle(ClaimResponse claimResponse) {
@@ -419,7 +824,7 @@ public class PasResponseBuilder {
     bundle.setType(Bundle.BundleType.COLLECTION);
     bundle.setTimestamp(new Date());
     bundle.setIdentifier(new Identifier()
-        .setSystem("http://example.org/SUBMITTER_TRANSACTION_IDENTIFIER")
+        .setSystem(identifierSystem("submitter-transaction-identifier"))
         .setValue(UUID.randomUUID().toString()));
 
     String idPart = extractClaimResponseIdPart(claimResponse);
@@ -464,9 +869,66 @@ public class PasResponseBuilder {
   private void addReferencedCommunicationRequests(Bundle responseBundle, ClaimResponse cr,
       Function<Reference, Resource> resourceResolver) {
     Set<String> addedKeys = new HashSet<>();
+    // PAS CommunicationRequest status is fixed to active: a request that has been answered or
+    // withdrawn is no longer an outstanding ask, so it is left out along with the reference to it.
+    cr.getCommunicationRequest().removeIf(ref ->
+        resourceResolver.apply(ref) instanceof CommunicationRequest request && isClosed(request));
     for (Reference ref : cr.getCommunicationRequest()) {
       addReferencedResource(responseBundle, ref, resourceResolver, addedKeys);
     }
+  }
+
+  private static boolean isClosed(CommunicationRequest request) {
+    return request.getStatus() == CommunicationRequest.CommunicationRequestStatus.COMPLETED
+        || request.getStatus() == CommunicationRequest.CommunicationRequestStatus.REVOKED
+        || request.getStatus() == CommunicationRequest.CommunicationRequestStatus.ENTEREDINERROR;
+  }
+
+  /**
+   * Adds what else the authorization points at, so an inquiry Bundle is self-contained: any
+   * other resource the ClaimResponse references (such as an authorized or added-item provider),
+   * the Practitioner behind an included PractitionerRole, and the Tasks raised for its Claim.
+   */
+  private void addSupportingResources(Bundle responseBundle, ClaimResponse cr,
+      Function<Reference, Resource> resourceResolver) {
+    Set<String> addedKeys = new HashSet<>();
+    for (Bundle.BundleEntryComponent entry : responseBundle.getEntry()) {
+      addedKeys.add(resourceKey(entry.getResource()));
+    }
+
+    for (Reference ref : FhirContext.forR4Cached().newTerser()
+        .getAllPopulatedChildElementsOfType(cr, Reference.class)) {
+      // The stored Claim is not part of a response Bundle
+      if (ref != cr.getRequest()) {
+        addReferencedResource(responseBundle, ref, resourceResolver, addedKeys);
+      }
+    }
+
+    for (Bundle.BundleEntryComponent entry : List.copyOf(responseBundle.getEntry())) {
+      if (entry.getResource() instanceof PractitionerRole role) {
+        addReferencedResource(responseBundle, role.getPractitioner(), resourceResolver, addedKeys);
+      }
+    }
+
+    String claimReference = ResourceResolver.toVersionlessTypedReference(cr.getRequest(), "Claim");
+    if (claimReference == null || !cr.getPatient().hasReference()) {
+      return;
+    }
+    SearchParameterMap params = new SearchParameterMap();
+    params.setLoadSynchronous(true);
+    params.add("patient", new ReferenceParam(cr.getPatient().getReference()));
+    for (Task task : daoRegistry.getResourceDao(Task.class)
+        .searchForResources(params, new SystemRequestDetails())) {
+      // PAS Task.reasonReference names the Claim the request for information is about
+      if (claimReference.equals(
+          ResourceResolver.toVersionlessTypedReference(task.getReasonReference(), "Claim"))) {
+        addReferencedResource(responseBundle, new Reference(resourceKey(task)), ref -> task, addedKeys);
+      }
+    }
+  }
+
+  private static String resourceKey(Resource resource) {
+    return resource.fhirType() + "/" + resource.getIdElement().getIdPart();
   }
 
   private void addReferencedResource(Bundle responseBundle, Reference ref,
@@ -496,7 +958,12 @@ public class PasResponseBuilder {
     }
   }
 
-  private boolean requiresAuthorizationNumber(String reviewActionCode) {
+  /** Namespace for the identifiers this payer assigns, rooted at its own base URL. */
+  private String identifierSystem(String name) {
+    return serverBase + "/identifier/" + name;
+  }
+
+  private static boolean requiresAuthorizationNumber(String reviewActionCode) {
     return REVIEW_CODE_A1.equals(reviewActionCode) || REVIEW_CODE_A6.equals(reviewActionCode);
   }
 
@@ -584,12 +1051,22 @@ public class PasResponseBuilder {
       // an equivalent open request during persistence, the original trace number survives.
       for (String questionnaireCanonical : decision.questionnaireUrls()) {
         addCommunicationRequest(responseBundle, claimResponse,
-            PasCommunicationRequestBuilder.buildQuestionnaireRequest(lineNumber, patientRef,
-                nextTraceNumber(authNumberPrefix), questionnaireCanonical));
+            PasCommunicationRequestBuilder.addressFromClaim(
+                PasCommunicationRequestBuilder.buildQuestionnaireRequest(lineNumber, patientRef,
+                    nextTraceNumber(authNumberPrefix), questionnaireCanonical),
+                requestClaim));
       }
       for (String code : decision.requestedAttachmentCodes()) {
-        addCommunicationRequest(responseBundle, claimResponse,
-            PasCommunicationRequestBuilder.buildAttachmentCodeRequest(lineNumber, code, patientRef));
+        CommunicationRequest request = PasCommunicationRequestBuilder.addressFromClaim(
+            PasCommunicationRequestBuilder.buildAttachmentCodeRequest(lineNumber, code, patientRef),
+            requestClaim);
+        addCommunicationRequest(responseBundle, claimResponse, request);
+        // The same ask as a PAS Task, which tracks it until the document arrives through CDex
+        Task task = PasTaskBuilder.buildAttachmentRequest(lineNumber, code, requestClaim,
+            resolveNpiFromBundle(requestClaim.getInsurer(), responseBundle),
+            resolveNpiFromBundle(requestClaim.getProvider(), responseBundle), serverBase);
+        PasTaskBuilder.setTraceNumber(task, request.getIdentifierFirstRep());
+        responseBundle.addEntry().setFullUrl("urn:uuid:" + task.getId()).setResource(task);
       }
     }
   }

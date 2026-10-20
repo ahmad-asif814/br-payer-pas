@@ -7,6 +7,7 @@ import org.hl7.fhir.r4.model.ClaimResponse;
 import org.hl7.fhir.r4.model.CodeableConcept;
 import org.hl7.fhir.r4.model.DomainResource;
 import org.hl7.fhir.r4.model.Coding;
+import org.hl7.fhir.r4.model.DateTimeType;
 import org.hl7.fhir.r4.model.DateType;
 import org.hl7.fhir.r4.model.Extension;
 import org.hl7.fhir.r4.model.Identifier;
@@ -143,6 +144,12 @@ public final class PasExtensions {
    * Builds an itemRequestedServiceDate extension wrapping the given serviced[x] value.
    */
   public static Extension buildRequestedServiceDateExtension(Type servicedValue) {
+    // The extension allows dateTime or Period only; a Claim servicedDate is a date, which
+    // dateTime can carry at the same precision.
+    if (servicedValue instanceof DateType date) {
+      return new Extension(PasConstants.ITEM_REQUESTED_SERVICE_DATE,
+          new DateTimeType(date.getValueAsString()));
+    }
     return new Extension(PasConstants.ITEM_REQUESTED_SERVICE_DATE, servicedValue.copy());
   }
 

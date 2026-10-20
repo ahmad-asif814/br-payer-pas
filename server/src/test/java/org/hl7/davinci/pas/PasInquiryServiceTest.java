@@ -107,7 +107,7 @@ class PasInquiryServiceTest {
         .thenReturn(List.of(matchingClaim, nonMatchingClaim));
 
     Parameters expected = new Parameters();
-    expected.addParameter().setName("responseBundle").setResource(new Bundle());
+    expected.addParameter().setName("return").setResource(new Bundle());
     when(responseBuilder.buildInquiryResponse(List.of(matchingResponse))).thenReturn(expected);
 
     Parameters result = service.inquire(requestBundle);

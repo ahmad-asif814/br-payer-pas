@@ -10,6 +10,7 @@ import java.util.Set;
 import org.hl7.fhir.r4.model.Claim;
 import org.hl7.fhir.r4.model.ClaimResponse;
 import org.hl7.fhir.r4.model.CodeableConcept;
+import org.hl7.fhir.r4.model.DateTimeType;
 import org.hl7.fhir.r4.model.DateType;
 import org.hl7.fhir.r4.model.Extension;
 import org.hl7.fhir.r4.model.Identifier;
@@ -112,12 +113,14 @@ class PasExtensionsTest {
   }
 
   @Test
-  void buildRequestedServiceDateExtension_wrapsDateType() {
-    DateType dateType = new DateType(new Date());
+  void buildRequestedServiceDateExtension_carriesDateAsDateTime() {
+    DateType dateType = new DateType("2026-08-09");
     Extension ext = PasExtensions.buildRequestedServiceDateExtension(dateType);
 
     assertEquals(PasConstants.ITEM_REQUESTED_SERVICE_DATE, ext.getUrl());
-    assertInstanceOf(DateType.class, ext.getValue());
+    // The extension allows dateTime or Period only
+    DateTimeType value = assertInstanceOf(DateTimeType.class, ext.getValue());
+    assertEquals("2026-08-09", value.getValueAsString());
   }
 
   // ===== Serviced Value Extraction =====

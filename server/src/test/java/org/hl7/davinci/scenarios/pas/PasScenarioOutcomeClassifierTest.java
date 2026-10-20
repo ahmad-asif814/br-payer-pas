@@ -87,13 +87,13 @@ class PasScenarioOutcomeClassifierTest {
   void evaluationFailureReturnsNullAndIsNotCached() {
     when(evaluator.evaluate(any(), anyList(), any(), anyString(), any()))
         .thenThrow(new RuntimeException("cql failure"))
-        .thenReturn(new CoverageDecision("A3", "Not Required", false));
+        .thenReturn(new CoverageDecision("NA", "Not Required", false));
 
     assertNull(classifier.classify("flaky", initialBundle()));
 
     ExpectedOutcome retried = classifier.classify("flaky", initialBundle());
     assertNotNull(retried);
-    assertEquals("A3", retried.reviewActionCode());
+    assertEquals("NA", retried.reviewActionCode());
   }
 
   @Test

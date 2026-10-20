@@ -25,9 +25,12 @@ import org.hl7.fhir.r4.model.Parameters;
 import org.hl7.fhir.r4.model.Patient;
 import org.hl7.fhir.r4.model.Period;
 import org.hl7.fhir.r4.model.Questionnaire;
+import org.hl7.fhir.r4.model.Practitioner;
+import org.hl7.fhir.r4.model.PractitionerRole;
 import org.hl7.fhir.r4.model.Reference;
 import org.hl7.fhir.r4.model.SimpleQuantity;
 import org.hl7.fhir.r4.model.StringType;
+import org.hl7.fhir.r4.model.Task;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -146,10 +149,10 @@ class PasResponseBuilderTest {
   }
 
   @Test
-  void buildSubmitResponse_denied_hasA2() {
+  void buildSubmitResponse_denied_hasA3() {
     Claim claim = buildClaim();
     var decisions = Map.of(1,
-        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A2, "Not Certified", false));
+        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A3, "Not Certified", false));
 
     Bundle response = builder.buildSubmitResponse(claim, new Bundle(), decisions, "AUTH");
 
@@ -158,7 +161,7 @@ class PasResponseBuilderTest {
         .getExtensionByUrl(PasConstants.REVIEW_ACTION);
     Extension codeExt = reviewAction.getExtensionByUrl(PasConstants.REVIEW_ACTION_CODE);
     CodeableConcept cc = (CodeableConcept) codeExt.getValue();
-    assertEquals("A2", cc.getCodingFirstRep().getCode());
+    assertEquals("A3", cc.getCodingFirstRep().getCode());
   }
 
   @Test
@@ -168,7 +171,7 @@ class PasResponseBuilderTest {
         new CodeableConcept().addCoding(new Coding("http://example.com", "99214", "Office Visit")));
     var decisions = Map.of(
         1, new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A1, "Certified in total", false),
-        2, new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A3, "Not Required", false));
+        2, new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_NA, "Not Required", false));
 
     Bundle response = builder.buildSubmitResponse(claim, new Bundle(), decisions, "AUTH");
     ClaimResponse cr = (ClaimResponse) response.getEntryFirstRep().getResource();
@@ -183,7 +186,7 @@ class PasResponseBuilderTest {
     Claim claim = buildClaim();
     claim.setId("test-claim");
     var decisions = Map.of(1,
-        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A3, "Not Required", false));
+        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_NA, "Not Required", false));
 
     Bundle response = builder.buildSubmitResponse(claim, new Bundle(), decisions, "AUTH");
     ClaimResponse cr = (ClaimResponse) response.getEntryFirstRep().getResource();
@@ -218,9 +221,91 @@ class PasResponseBuilderTest {
     Parameters params = builder.buildInquiryResponse(List.of(cr));
     assertNotNull(params);
     assertFalse(params.getParameter().isEmpty());
-    assertEquals("responseBundle", params.getParameter().get(0).getName());
+    assertEquals("return", params.getParameter().get(0).getName());
     assertNotNull(params.getParameter().get(0).getResource());
     assertInstanceOf(Bundle.class, params.getParameter().get(0).getResource());
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void buildInquiryResponse_includesReferencedResources() {
+    ClaimResponse cr = new ClaimResponse();
+    cr.setId("CR-001");
+    cr.setPatient(new Reference("Patient/100"));
+    cr.setInsurer(new Reference("Organization/200"));
+    Patient patient = new Patient();
+    patient.setId("Patient/100");
+    Organization insurer = new Organization();
+    insurer.setId("Organization/200");
+    IFhirResourceDao<Patient> patientDao = mock(IFhirResourceDao.class);
+    IFhirResourceDao<Organization> orgDao = mock(IFhirResourceDao.class);
+    when(daoRegistry.getResourceDao("Patient")).thenReturn(patientDao);
+    when(daoRegistry.getResourceDao("Organization")).thenReturn(orgDao);
+    when(patientDao.read(any(), any())).thenReturn(patient);
+    when(orgDao.read(any(), any())).thenReturn(insurer);
+
+    Bundle bundle = (Bundle) builder.buildInquiryResponse(List.of(cr)).getParameter().get(0).getResource();
+
+    assertTrue(bundle.getEntry().stream().anyMatch(e -> e.getResource() instanceof Patient));
+    assertTrue(bundle.getEntry().stream().anyMatch(e -> e.getResource() instanceof Organization));
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void buildInquiryResponse_includesProvidersAndTasksOfTheAuthorization() {
+    ClaimResponse cr = new ClaimResponse();
+    cr.setId("CR-001");
+    cr.setPatient(new Reference("Patient/100"));
+    cr.setRequest(new Reference("Claim/900"));
+    cr.addAddItem().addProvider(new Reference("PractitionerRole/300"));
+
+    Patient patient = new Patient();
+    patient.setId("Patient/100");
+    PractitionerRole role = new PractitionerRole();
+    role.setId("PractitionerRole/300");
+    role.setPractitioner(new Reference("Practitioner/400"));
+    Practitioner practitioner = new Practitioner();
+    practitioner.setId("Practitioner/400");
+    Task forThisClaim = new Task();
+    forThisClaim.setId("Task/500");
+    forThisClaim.setReasonReference(new Reference("Claim/900"));
+    Task forAnotherClaim = new Task();
+    forAnotherClaim.setId("Task/501");
+    forAnotherClaim.setReasonReference(new Reference("Claim/901"));
+
+    IFhirResourceDao<Patient> patientDao = mock(IFhirResourceDao.class);
+    IFhirResourceDao<PractitionerRole> roleDao = mock(IFhirResourceDao.class);
+    IFhirResourceDao<Practitioner> practitionerDao = mock(IFhirResourceDao.class);
+    IFhirResourceDao<Task> taskDao = mock(IFhirResourceDao.class);
+    when(daoRegistry.getResourceDao("Patient")).thenReturn(patientDao);
+    when(daoRegistry.getResourceDao("PractitionerRole")).thenReturn(roleDao);
+    when(daoRegistry.getResourceDao("Practitioner")).thenReturn(practitionerDao);
+    when(daoRegistry.getResourceDao(Task.class)).thenReturn(taskDao);
+    when(patientDao.read(any(), any())).thenReturn(patient);
+    when(roleDao.read(any(), any())).thenReturn(role);
+    when(practitionerDao.read(any(), any())).thenReturn(practitioner);
+    when(taskDao.searchForResources(any(), any())).thenReturn(List.of(forThisClaim, forAnotherClaim));
+
+    Bundle bundle = (Bundle) builder.buildInquiryResponse(List.of(cr)).getParameter().get(0).getResource();
+
+    List<String> entries = bundle.getEntry().stream()
+        .map(e -> e.getResource().fhirType() + "/" + e.getResource().getIdElement().getIdPart())
+        .toList();
+    assertEquals(List.of("ClaimResponse/CR-001", "Patient/100", "PractitionerRole/300",
+        "Practitioner/400", "Task/500"), entries);
+  }
+
+  @Test
+  void buildSubmitResponse_identifiersUsePayerOwnedSystems() {
+    var decisions = Map.of(1,
+        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A1, "Certified in total", false));
+
+    Bundle response = builder.buildSubmitResponse(buildClaim(), new Bundle(), decisions, "AUTH");
+
+    // The PAS profiles reject example.org systems
+    ClaimResponse cr = (ClaimResponse) response.getEntryFirstRep().getResource();
+    assertTrue(response.getIdentifier().getSystem().startsWith(SERVER_BASE + "/identifier/"));
+    assertTrue(cr.getIdentifierFirstRep().getSystem().startsWith(SERVER_BASE + "/identifier/"));
   }
 
   @Test
@@ -258,7 +343,7 @@ class PasResponseBuilderTest {
 
     var decisions = Map.of(
         1, new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A4, "Pending", true),
-        2, new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A2, "Not Certified", false));
+        2, new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A3, "Not Certified", false));
     Bundle pendedResponse = builder.buildSubmitResponse(claim, new Bundle(), decisions, "AUTH");
     ClaimResponse pendedCr = (ClaimResponse) pendedResponse.getEntryFirstRep().getResource();
 
@@ -278,7 +363,7 @@ class PasResponseBuilderTest {
         .getExtensionByUrl(PasConstants.REVIEW_ACTION);
     Extension deniedCodeExt = deniedReviewAction.getExtensionByUrl(PasConstants.REVIEW_ACTION_CODE);
     CodeableConcept deniedCode = (CodeableConcept) deniedCodeExt.getValue();
-    assertEquals("A2", deniedCode.getCodingFirstRep().getCode());
+    assertEquals("A3", deniedCode.getCodingFirstRep().getCode());
     assertNull(deniedReviewAction.getExtensionByUrl("number"));
     assertNull(unchangedDeniedItem.getExtensionByUrl(PasConstants.ITEM_PREAUTH_PERIOD));
   }
@@ -377,7 +462,7 @@ class PasResponseBuilderTest {
 
     // Apply A2 (denial/cancel) -- adminRefNumber should be removed
     var decisions = Map.of(1,
-        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A2, "Not Certified", false));
+        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A3, "Not Certified", false));
     builder.applyItemDecisions(cr, decisions, "AUTH");
 
     assertNull(cr.getItem().get(0).getExtensionByUrl(PasConstants.ADMIN_REF_NUMBER),
@@ -410,13 +495,13 @@ class PasResponseBuilderTest {
 
     // Apply decision to seq 2 (not in original CR)
     var decisions = Map.of(2,
-        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A3, "Not Required", false));
+        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_NA, "Not Required", false));
     builder.applyItemDecisions(cr, decisions, "AUTH");
 
     assertEquals(2, cr.getItem().size());
     assertEquals(2, cr.getItem().get(1).getItemSequence());
     String newItemCode = PasExtensions.extractReviewActionCode(cr.getItem().get(1));
-    assertEquals(REVIEW_CODE_A3, newItemCode);
+    assertEquals(REVIEW_CODE_NA, newItemCode);
   }
 
   @Test
@@ -442,7 +527,7 @@ class PasResponseBuilderTest {
 
     // Apply A2 (denial) -- preAuthPeriod should be removed
     var decisions = Map.of(1,
-        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A2, "Not Certified", false));
+        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A3, "Not Certified", false));
     builder.applyItemDecisions(cr, decisions, "AUTH");
 
     Extension preAuthPeriod = cr.getItem().get(0).getExtensionByUrl(PasConstants.ITEM_PREAUTH_PERIOD);
@@ -939,12 +1024,218 @@ class PasResponseBuilderTest {
         "notification bundle must include the referenced CommunicationRequest");
   }
 
+  @Test
+  void buildNotificationResponseBundle_leavesOutClosedRequestsAndTheDiagnosisEcho() {
+    ClaimResponse cr = new ClaimResponse();
+    cr.setId("cr-1");
+    cr.setStatus(ClaimResponse.ClaimResponseStatus.ACTIVE);
+    cr.addItem().setItemSequence(1).addExtension(PasConstants.EXT_COMMUNICATED_DIAGNOSIS,
+        new CodeableConcept().addCoding(new Coding("http://hl7.org/fhir/sid/icd-10-cm", "G89.4", null)));
+    cr.addCommunicationRequest(new Reference("CommunicationRequest/answered"));
+    cr.addCommunicationRequest(new Reference("CommunicationRequest/open"));
+
+    CommunicationRequest answered = new CommunicationRequest();
+    answered.setId("answered");
+    answered.setStatus(CommunicationRequest.CommunicationRequestStatus.COMPLETED);
+    CommunicationRequest open = new CommunicationRequest();
+    open.setId("open");
+    open.setStatus(CommunicationRequest.CommunicationRequestStatus.ACTIVE);
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    IFhirResourceDao commReqDao = mock(IFhirResourceDao.class);
+    when(daoRegistry.getResourceDao("CommunicationRequest")).thenReturn(commReqDao);
+    when(commReqDao.read(any(IdType.class), any())).thenAnswer(call ->
+        "answered".equals(((IdType) call.getArgument(0)).getIdPart()) ? answered : open);
+
+    Bundle bundle = builder.buildNotificationResponseBundle(cr, daoRegistry);
+
+    ClaimResponse sent = (ClaimResponse) bundle.getEntryFirstRep().getResource();
+    assertEquals(List.of("CommunicationRequest/open"),
+        sent.getCommunicationRequest().stream().map(Reference::getReference).toList());
+    assertEquals(1, bundle.getEntry().stream()
+        .filter(e -> e.getResource() instanceof CommunicationRequest).count());
+    assertNull(sent.getItemFirstRep().getExtensionByUrl(PasConstants.EXT_COMMUNICATED_DIAGNOSIS));
+    assertEquals(2, cr.getCommunicationRequest().size(), "the stored ClaimResponse is left as it is");
+    assertNotNull(cr.getItemFirstRep().getExtensionByUrl(PasConstants.EXT_COMMUNICATED_DIAGNOSIS));
+  }
+
   private static CommunicationRequest firstCommunicationRequest(Bundle bundle) {
     return bundle.getEntry().stream()
         .map(Bundle.BundleEntryComponent::getResource)
         .filter(CommunicationRequest.class::isInstance)
         .map(CommunicationRequest.class::cast)
         .findFirst().orElse(null);
+  }
+
+  // ===== Decision detail =====
+
+  @Test
+  void buildSubmitResponse_notesEachDecisionAndSummarisesItInTheHeader() {
+    Claim claim = buildClaim();
+    claim.setProvider(new Reference("Organization/2"));
+    claim.addItem().setSequence(2).setProductOrService(new CodeableConcept().addCoding(
+        new Coding("http://example.com", "99214", "Office Visit")));
+    var decisions = Map.of(
+        1, new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A1, "Certified in total", false),
+        2, new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A3, "Not Certified", false));
+
+    ClaimResponse cr = (ClaimResponse) builder.buildSubmitResponse(claim, new Bundle(), decisions, "AUTH")
+        .getEntryFirstRep().getResource();
+
+    assertEquals(2, cr.getProcessNote().size());
+    assertEquals(1, cr.getItem().get(0).getNoteNumber().get(0).getValue());
+    assertEquals(2, cr.getItem().get(1).getNoteNumber().get(0).getValue());
+    assertEquals("Line 1: certified in total.", cr.getProcessNote().get(0).getText());
+
+    Extension headerAction = cr.getAdjudicationFirstRep().getExtensionByUrl(PasConstants.REVIEW_ACTION);
+    assertEquals(PasExtensions.extractAuthorizationNumber(cr.getItem().get(0)),
+        ((StringType) headerAction.getExtensionByUrl("number").getValue()).getValue(),
+        "the header carries the request's authorization number");
+    assertNull(headerAction.getExtensionByUrl(PasConstants.REVIEW_ACTION_CODE));
+    assertTrue(cr.hasPreAuthPeriod(), "a certified line gives the authorization a period");
+    assertEquals("Organization/2", ((Reference) cr.getExtensionByUrl(PasConstants.ITEM_AUTHORIZED_PROVIDER)
+        .getExtensionByUrl("provider").getValue()).getReference());
+    Extension reviewer = cr.getExtensionByUrl(PasConstants.CLAIM_RESPONSE_REVIEWER);
+    assertFalse(((org.hl7.fhir.r4.model.BooleanType) reviewer.getExtensionByUrl("wasHumanReviewedFlag")
+        .getValue()).booleanValue());
+  }
+
+  @Test
+  void buildSubmitResponse_certifiedLineCarriesWhatWasAuthorizedAndItsContext() {
+    Claim claim = buildClaimWithLineContext();
+    var decisions = Map.of(1,
+        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A1, "Certified in total", false));
+
+    ClaimResponse cr = (ClaimResponse) builder.buildSubmitResponse(claim, careTeamBundle(), decisions, "AUTH")
+        .getEntryFirstRep().getResource();
+    ClaimResponse.ItemComponent item = cr.getItem().get(0);
+
+    assertEquals("Practitioner/doc-1", ((Reference) item.getExtensionByUrl(PasConstants.ITEM_AUTHORIZED_PROVIDER)
+        .getExtensionByUrl("provider").getValue()).getReference(),
+        "the practitioner of the line's care-team role is authorized");
+    Extension detailQuantity = item.getExtensionByUrl(PasConstants.ITEM_AUTHORIZED_DETAIL).getExtensionByUrl("quantity");
+    assertEquals(org.hl7.fhir.r4.model.Quantity.class, detailQuantity.getValue().getClass(),
+        "value[x] must be a plain Quantity");
+    Extension detail = item.getExtensionByUrl(PasConstants.ITEM_AUTHORIZED_DETAIL);
+    assertEquals("99213", ((CodeableConcept) detail.getExtensionByUrl("productOrServiceCode").getValue())
+        .getCodingFirstRep().getCode());
+    assertEquals("PREV-1", ((StringType) item.getExtensionByUrl(PasConstants.AUTHORIZATION_NUMBER).getValue())
+        .getValue(), "the authorization number the provider cited is returned as the previous one");
+    assertEquals("2021-09-10", ((Period) item.getExtensionByUrl(PasConstants.ADMISSION_DATES).getValue())
+        .getStartElement().getValueAsString());
+    assertEquals("2021-09-13", ((DateType) item.getExtensionByUrl(PasConstants.DISCHARGE_DATE).getValue())
+        .getValueAsString());
+    assertEquals("G89.4", ((CodeableConcept) item.getExtensionByUrl(PasConstants.EXT_COMMUNICATED_DIAGNOSIS)
+        .getValue()).getCodingFirstRep().getCode());
+  }
+
+  @Test
+  void buildSubmitResponse_echoesTheProvidersTraceNumberWithItsIdentifierExtensions() {
+    Claim claim = buildClaim();
+    Identifier trace = claim.addIdentifier().setSystem("http://provider.test/trn").setValue("TRN-1");
+    trace.addExtension(PasConstants.IDENTIFIER_SUB_DEPARTMENT, new StringType("223412"));
+    trace.addExtension("http://example.com/unknown", new StringType("dropped"));
+
+    ClaimResponse cr = (ClaimResponse) builder.buildSubmitResponse(claim, new Bundle(), Map.of(), "AUTH")
+        .getEntryFirstRep().getResource();
+
+    assertTrue(cr.getIdentifierFirstRep().getSystem().startsWith(SERVER_BASE), "the payer's own trace comes first");
+    Identifier echoed = cr.getIdentifier().get(1);
+    assertEquals("TRN-1", echoed.getValue());
+    assertNotNull(echoed.getExtensionByUrl(PasConstants.IDENTIFIER_SUB_DEPARTMENT));
+    assertNull(echoed.getExtensionByUrl("http://example.com/unknown"));
+  }
+
+  @Test
+  void buildSubmitResponse_a6_addItemIsTheRequestedLineWithThePayersChange() {
+    Claim claim = buildClaimWithLineContext();
+    SimpleQuantity approved = new SimpleQuantity();
+    approved.setValue(3);
+    var decisions = Map.of(1,
+        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A6, "Modified", false, null, approved));
+
+    ClaimResponse cr = (ClaimResponse) builder.buildSubmitResponse(claim, careTeamBundle(), decisions, "AUTH")
+        .getEntryFirstRep().getResource();
+    ClaimResponse.AddedItemComponent addItem = cr.getAddItemFirstRep();
+
+    assertEquals("99213", addItem.getProductOrService().getCodingFirstRep().getCode());
+    assertEquals(3, addItem.getQuantity().getValue().intValue());
+    assertEquals("visit", addItem.getQuantity().getUnit());
+    assertEquals("25", addItem.getModifierFirstRep().getCodingFirstRep().getCode());
+    assertTrue(addItem.hasUnitPrice() && addItem.hasServiced() && addItem.hasLocation());
+    assertEquals("Practitioner/doc-1", addItem.getProviderFirstRep().getReference());
+    assertNotNull(addItem.getProviderFirstRep().getExtensionByUrl(PasConstants.AUTHORIZED_PROVIDER_TYPE));
+    for (String url : List.of(PasConstants.EPSDT_INDICATOR, PasConstants.AUTHORIZATION_NUMBER,
+        PasConstants.REVENUE_CODE, PasConstants.ITEM_PREAUTH_PERIOD, PasConstants.ITEM_PREAUTH_ISSUE_DATE,
+        PasConstants.ADMISSION_DATES, PasConstants.DISCHARGE_DATE)) {
+      assertNotNull(addItem.getExtensionByUrl(url), "addItem must carry " + url);
+    }
+    assertTrue(cr.getProcessNoteFirstRep().getText().contains("3 unit(s) authorized"));
+  }
+
+  @Test
+  void buildSubmitResponse_pendedWithAttachmentCode_addsContentModifierAndTask() {
+    Claim claim = buildClaim();
+    var decisions = Map.of(1,
+        new PasCoverageEvaluator.CoverageDecision(REVIEW_CODE_A4, "Pending", true, null, null,
+            "clinical", List.of(), List.of("18776-5")));
+
+    Bundle response = builder.buildSubmitResponse(claim, new Bundle(), decisions, "AUTH");
+
+    CommunicationRequest commReq = firstCommunicationRequest(response);
+    assertEquals(PasConstants.LOINC_ATTACHMENT_MODIFIER, ((CodeableConcept) commReq.getPayloadFirstRep()
+        .getExtensionByUrl(PasConstants.EXT_CONTENT_MODIFIER).getValue()).getCodingFirstRep().getCode());
+
+    Task task = response.getEntry().stream().map(Bundle.BundleEntryComponent::getResource)
+        .filter(Task.class::isInstance).map(Task.class::cast).findFirst()
+        .orElseThrow(() -> new AssertionError("a document-by-code request comes with a PAS Task"));
+    assertEquals(commReq.getIdentifierFirstRep().getValue(), task.getIdentifierFirstRep().getValue());
+    assertEquals("attachment-request-code", task.getCode().getCodingFirstRep().getCode());
+    assertEquals("Patient/1", task.getFor().getReference());
+    assertEquals("Organization/1", task.getRequester().getReference());
+    assertEquals("PractitionerRole/1", task.getOwner().getReference());
+    assertTrue(task.getRestriction().hasPeriod());
+    assertEquals("code|1|18776-5", PasTaskBuilder.documentKey(task));
+    Task.ParameterComponent payerUrl = task.getInput().get(0);
+    assertEquals(SERVER_BASE, payerUrl.getValue().primitiveValue());
+    Task.ParameterComponent context = task.getInput().stream()
+        .filter(input -> input.getType().hasCoding(PasConstants.PAS_TEMP_CODES_SYSTEM, "questionnaire-context"))
+        .findFirst()
+        .orElseThrow(() -> new AssertionError("the Task carries the line's DTR context"));
+    assertEquals(task.getIdentifierFirstRep().getValue(), context.getValue().primitiveValue());
+    assertNotNull(context.getExtensionByUrl(PasConstants.EXT_SERVICE_LINE_NUMBER));
+  }
+
+  @Test
+  void buildErrorResponse_rejectsTheLinesWithX12Errors() {
+    Claim claim = buildClaim();
+
+    Bundle response = builder.buildErrorResponse(claim, new Bundle(), claim.getItem());
+
+    assertTrue(response.getEntryFirstRep().getFullUrl().startsWith("urn:uuid:"), "nothing is stored for it");
+    ClaimResponse cr = (ClaimResponse) response.getEntryFirstRep().getResource();
+    assertEquals(ClaimResponse.RemittanceOutcome.ERROR, cr.getOutcome());
+    assertTrue(cr.getItem().isEmpty());
+    assertNotNull(cr.getRequest().getExtensionByUrl(PasConstants.DATA_ABSENT_REASON));
+    ClaimResponse.ErrorComponent error = cr.getErrorFirstRep();
+    assertEquals(1, error.getItemSequence());
+    assertEquals("AG", error.getCode().getCodingFirstRep().getCode());
+    assertNotNull(error.getExtensionByUrl(PasConstants.ERROR_FOLLOWUP_ACTION));
+    assertEquals("Bundle.entry[0].Claim.item[0].productOrService",
+        ((StringType) error.getExtensionByUrl(PasConstants.ERROR_PATH).getValue()).getValue());
+    assertEquals(1, ((org.hl7.fhir.r4.model.PositiveIntType) error.getExtensionByUrl(PasConstants.ERROR_ELEMENT)
+        .getExtensionByUrl("processNote").getValue()).getValue());
+  }
+
+  @Test
+  void resolvePendedItems_notesTheNewDecisionAndRefreshesTheHeader() {
+    ClaimResponse cr = buildClaimResponseWithItems(Map.of(1, REVIEW_CODE_A4));
+
+    builder.resolvePendedItems(cr, "AUTH");
+
+    assertEquals("Line 1: certified in total.", cr.getProcessNoteFirstRep().getText());
+    assertNotNull(cr.getAdjudicationFirstRep().getExtensionByUrl(PasConstants.REVIEW_ACTION)
+        .getExtensionByUrl("number"), "the new authorization number reaches the header");
+    assertTrue(cr.hasPreAuthPeriod());
   }
 
   // ===== Helpers =====
@@ -961,6 +1252,44 @@ class PasResponseBuilderTest {
     claim.addItem().setSequence(1)
         .setProductOrService(new CodeableConcept().addCoding(
             new Coding("http://example.com", "99213", "Office Visit")));
+    return claim;
+  }
+
+  /** Request Bundle holding the care-team role that buildClaimWithLineContext points at. */
+  private static Bundle careTeamBundle() {
+    PractitionerRole role = new PractitionerRole();
+    role.setId("care-1");
+    role.setPractitioner(new Reference("Practitioner/doc-1"));
+    Bundle bundle = new Bundle();
+    bundle.addEntry().setFullUrl(SERVER_BASE + "/PractitionerRole/care-1").setResource(role);
+    return bundle;
+  }
+
+  /** A single-line Claim with the care team, diagnosis, stay dates and line details a PAS request carries. */
+  private Claim buildClaimWithLineContext() {
+    Claim claim = buildClaim();
+    claim.addCareTeam().setSequence(1).setProvider(new Reference("PractitionerRole/care-1"));
+    claim.addDiagnosis().setSequence(1).setDiagnosis(new CodeableConcept().addCoding(
+        new Coding("http://hl7.org/fhir/sid/icd-10-cm", "G89.4", null)));
+    claim.addSupportingInfo().setSequence(1)
+        .setCategory(new CodeableConcept().addCoding(new Coding(null, "admissionDates", null)))
+        .setTiming(new Period().setStartElement(new org.hl7.fhir.r4.model.DateTimeType("2021-09-10")));
+    claim.addSupportingInfo().setSequence(2)
+        .setCategory(new CodeableConcept().addCoding(new Coding(null, "dischargeDates", null)))
+        .setTiming(new DateType("2021-09-13"));
+    Claim.ItemComponent item = claim.getItemFirstRep();
+    item.addCareTeamSequence(1);
+    item.addDiagnosisSequence(1);
+    item.addExtension(PasConstants.AUTHORIZATION_NUMBER, new StringType("PREV-1"));
+    item.addExtension(PasConstants.EPSDT_INDICATOR, new org.hl7.fhir.r4.model.BooleanType(false));
+    item.setRevenue(new CodeableConcept().addCoding(new Coding("https://www.nubc.org/revenue-code", "0105", null)));
+    item.addModifier(new CodeableConcept().addCoding(new Coding("http://www.ama-assn.org/go/cpt", "25", null)));
+    item.setServiced(new DateType("2021-09-10"));
+    item.setLocation(new CodeableConcept().addCoding(new Coding(null, "11", null)));
+    SimpleQuantity requested = new SimpleQuantity();
+    requested.setValue(6).setUnit("visit");
+    item.setQuantity(requested);
+    item.setUnitPrice(new org.hl7.fhir.r4.model.Money().setValue(100).setCurrency("USD"));
     return claim;
   }
 

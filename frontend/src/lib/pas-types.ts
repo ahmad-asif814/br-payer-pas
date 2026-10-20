@@ -37,7 +37,7 @@ export const X12_CERT_TYPE_SYSTEM = "https://codesystem.x12.org/005010/1322";
 // Review Action Codes
 // =============================================================================
 
-export type ReviewActionCode = "A1" | "A2" | "A3" | "A4" | "A6";
+export type ReviewActionCode = "A1" | "A2" | "A3" | "A4" | "A6" | "NA";
 
 interface ReviewActionConfig {
   code: ReviewActionCode;
@@ -60,21 +60,21 @@ export const REVIEW_ACTIONS: Record<ReviewActionCode, ReviewActionConfig> = {
   },
   A2: {
     code: "A2",
+    label: "Partially Certified",
+
+    bgClass: "bg-teal-100 dark:bg-teal-900/30",
+    textClass: "text-teal-700 dark:text-teal-400",
+    borderClass: "border-teal-300 dark:border-teal-700",
+    dotClass: "bg-teal-500",
+  },
+  A3: {
+    code: "A3",
     label: "Not Certified",
 
     bgClass: "bg-red-100 dark:bg-red-900/30",
     textClass: "text-red-700 dark:text-red-400",
     borderClass: "border-red-300 dark:border-red-700",
     dotClass: "bg-red-500",
-  },
-  A3: {
-    code: "A3",
-    label: "Not Required",
-
-    bgClass: "bg-gray-100 dark:bg-gray-800/30",
-    textClass: "text-gray-700 dark:text-gray-400",
-    borderClass: "border-gray-300 dark:border-gray-700",
-    dotClass: "bg-gray-400",
   },
   A4: {
     code: "A4",
@@ -93,6 +93,15 @@ export const REVIEW_ACTIONS: Record<ReviewActionCode, ReviewActionConfig> = {
     textClass: "text-blue-700 dark:text-blue-400",
     borderClass: "border-blue-300 dark:border-blue-700",
     dotClass: "bg-blue-500",
+  },
+  NA: {
+    code: "NA",
+    label: "Not Required",
+
+    bgClass: "bg-gray-100 dark:bg-gray-800/30",
+    textClass: "text-gray-700 dark:text-gray-400",
+    borderClass: "border-gray-300 dark:border-gray-700",
+    dotClass: "bg-gray-400",
   },
 };
 
@@ -402,7 +411,7 @@ export function extractResponseBundlesFromParameters(
   return p.parameter
     .filter(
       (param) =>
-        param.name === "responseBundle" &&
+        param.name === "return" &&
         param.resource?.resourceType === "Bundle",
     )
     .map((param) => param.resource as Bundle);

@@ -51,7 +51,7 @@ class PasCoverageEvaluatorTest {
   void mapCoverageInfo_notCovered_returnsA2() {
     Extension ext = buildCoverageInfoExt("not-covered", null, null);
     var decision = evaluator.mapCoverageInfoToReviewAction(ext);
-    assertEquals(REVIEW_CODE_A2, decision.reviewActionCode());
+    assertEquals(REVIEW_CODE_A3, decision.reviewActionCode());
     assertFalse(decision.isPended());
   }
 
@@ -83,7 +83,7 @@ class PasCoverageEvaluatorTest {
   void mapCoverageInfo_noAuth_returnsA3() {
     Extension ext = buildCoverageInfoExt("covered", "no-auth", null);
     var decision = evaluator.mapCoverageInfoToReviewAction(ext);
-    assertEquals(REVIEW_CODE_A3, decision.reviewActionCode());
+    assertEquals(REVIEW_CODE_NA, decision.reviewActionCode());
     assertFalse(decision.isPended());
   }
 
@@ -105,7 +105,7 @@ class PasCoverageEvaluatorTest {
       CoverageDecision decision = evaluator.evaluate(
           orderCode, List.of(), coverage, patientId, dataBundle);
 
-      assertEquals(REVIEW_CODE_A3, decision.reviewActionCode());
+      assertEquals(REVIEW_CODE_NA, decision.reviewActionCode());
       assertFalse(decision.isPended());
     }
 
@@ -146,7 +146,7 @@ class PasCoverageEvaluatorTest {
       CoverageDecision decision = evaluator.evaluate(
           orderCode, List.of(), coverage, patientId, dataBundle);
 
-      assertEquals(REVIEW_CODE_A2, decision.reviewActionCode());
+      assertEquals(REVIEW_CODE_A3, decision.reviewActionCode());
       assertFalse(decision.isPended());
     }
 
@@ -187,7 +187,7 @@ class PasCoverageEvaluatorTest {
       CoverageDecision decision = evaluator.evaluate(
           orderCode, List.of(), coverage, patientId, dataBundle);
 
-      assertEquals(REVIEW_CODE_A3, decision.reviewActionCode());
+      assertEquals(REVIEW_CODE_NA, decision.reviewActionCode());
       assertFalse(decision.isPended());
     }
 
@@ -212,7 +212,7 @@ class PasCoverageEvaluatorTest {
       CoverageDecision decision = evaluator.evaluate(
           orderCode, List.of(), coverage, patientId, bundle);
 
-      assertEquals(REVIEW_CODE_A3, decision.reviewActionCode());
+      assertEquals(REVIEW_CODE_NA, decision.reviewActionCode());
       verify(planDefinitionService).removeDispatchPlansLackingEvidence(any(), same(order));
     }
 

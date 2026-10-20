@@ -4,6 +4,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import org.hl7.fhir.r4.model.Claim;
+import org.hl7.fhir.r4.model.CodeableConcept;
+import org.hl7.fhir.r4.model.Coding;
 import org.hl7.fhir.r4.model.CommunicationRequest;
 import org.hl7.fhir.r4.model.PositiveIntType;
 import org.hl7.fhir.r4.model.Reference;
@@ -66,5 +69,24 @@ class PasCommunicationRequestBuilderTest {
     assertEquals(PasConstants.QUESTIONNAIRE_TRACE_NUMBER_SYSTEM,
         request.getIdentifierFirstRep().getSystem());
     assertFalse(request.getIdentifierFirstRep().getValue().isBlank());
+  }
+
+  @Test
+  void addressFromClaim_namesThePartiesAndTheWayToAnswer() {
+    Claim claim = new Claim();
+    claim.setInsurer(new Reference("Organization/insurer"));
+    claim.setProvider(new Reference("Organization/provider"));
+    claim.addDiagnosis().setDiagnosis(new CodeableConcept().addCoding(
+        new Coding("http://hl7.org/fhir/sid/icd-10-cm", "G89.4", null)));
+    CommunicationRequest request = PasCommunicationRequestBuilder.addressFromClaim(
+        PasCommunicationRequestBuilder.buildAttachmentCodeRequest(1, "18748-4", "Patient/pat-1"), claim);
+
+    assertEquals(PasConstants.MEDIUM_CDEX, request.getMediumFirstRep().getCodingFirstRep().getCode());
+    assertEquals("Organization/insurer", request.getRequester().getReference());
+    assertEquals("Organization/provider", request.getRecipientFirstRep().getReference());
+    assertEquals("Organization/provider", request.getSender().getReference());
+    CodeableConcept diagnosis = (CodeableConcept) request.getPayloadFirstRep()
+        .getExtensionByUrl(PasConstants.EXT_COMMUNICATED_DIAGNOSIS).getValue();
+    assertEquals("G89.4", diagnosis.getCodingFirstRep().getCode());
   }
 }

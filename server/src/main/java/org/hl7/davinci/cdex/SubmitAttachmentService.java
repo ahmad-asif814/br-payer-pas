@@ -8,6 +8,7 @@ import java.util.Set;
 import org.hl7.davinci.cdshooks.error.OperationOutcomeBuilder;
 import org.hl7.davinci.pas.PasConstants;
 import org.hl7.davinci.pas.PasPendedResolutionService;
+import org.hl7.davinci.pas.PasQuestionnaireAddresses;
 import org.hl7.fhir.r4.model.BooleanType;
 import org.hl7.fhir.r4.model.CanonicalType;
 import org.hl7.fhir.r4.model.ClaimResponse;
@@ -52,12 +53,15 @@ public class SubmitAttachmentService {
   private final DaoRegistry daoRegistry;
   private final PasPendedResolutionService resolutionService;
   private final FhirContext fhirContext;
+  private final PasQuestionnaireAddresses questionnaireAddresses;
 
   public SubmitAttachmentService(DaoRegistry daoRegistry,
-      PasPendedResolutionService resolutionService, FhirContext fhirContext) {
+      PasPendedResolutionService resolutionService, FhirContext fhirContext,
+      PasQuestionnaireAddresses questionnaireAddresses) {
     this.daoRegistry = daoRegistry;
     this.resolutionService = resolutionService;
     this.fhirContext = fhirContext;
+    this.questionnaireAddresses = questionnaireAddresses;
   }
 
   /** A submitted attachment: its content plus the service line numbers it targets (may be empty). */
@@ -198,7 +202,8 @@ public class SubmitAttachmentService {
     }
 
     if (attachment.content() instanceof QuestionnaireResponse qr && qr.hasQuestionnaire()) {
-      String canonical = qr.getQuestionnaire();
+      // Providers are given this server's address for the questionnaire; match on what it stands for
+      String canonical = questionnaireAddresses.canonicalOf(qr.getQuestionnaire());
       List<CommunicationRequest> matching = new ArrayList<>();
       for (CommunicationRequest cr : candidates) {
         if (canonicalsMatch(requestedQuestionnaire(cr), canonical)) {
